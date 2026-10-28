@@ -21,7 +21,7 @@ import { errorHandler } from "../../../middleware/error-handler.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, approvals, projects, issues, heartbeatRuns, heartbeatRunEvents, nativeRunFinalizations, budgetPolicies, environmentLeases, environments, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, applyPendingMigrations, closeRegisteredClients, createDb, type Db } from "@paperclipai/db";
+import { agents, approvals, projects, issues, heartbeatRuns, heartbeatRunEvents, nativeRunFinalizations, budgetPolicies, environmentLeases, environments, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, resourceLifecycleEvents, applyPendingMigrations, closeRegisteredClients, createDb, type Db } from "@paperclipai/db";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createAgentLifecycle, configureAgentLifecycle, startAgentLifecycle } from "../../../services/agent-lifecycle.js";
@@ -61,6 +61,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   }
   async function hire(status = "idle") { return createAgentLifecycle(db).requestHire(companyId, { name: "Agent", status, adapterType: "process" }); }
   async function current(id: string) { return (await db.select().from(agents).where(eq(agents.id, id)))[0]!; }
+  function resumeEvents(id: string) {
+    return db.select().from(resourceLifecycleEvents).where(and(eq(resourceLifecycleEvents.resourceId, id), eq(resourceLifecycleEvents.action, "resume")));
+  }
 
   it.each((["codex", "claude"] as const).flatMap(provider => ["direct", "setup", "approval"].map(path => [provider, path] as const)))("defaults a newly hired %s agent on a warm task environment to warm execution through %s", async (provider, path) => {
     const pluginId = randomUUID(), environmentId = randomUUID();
@@ -526,6 +529,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const aborted = await createAgentLifecycle(db).abortPause(agent.id);
     expect(aborted).toMatchObject({ lifecycleState: "ready", status: "idle", pauseReason: null });
     expect((await current(agent.id)).pausedAt).toBeNull();
+    expect(await resumeEvents(agent.id)).toHaveLength(1);
     await expect(createAgentLifecycle(db).abortPause(agent.id)).rejects.toThrow("Cannot abort an agent in state ready");
   });
 
@@ -578,6 +582,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await work.process(agent.id);
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle", pauseReason: null });
     expect(calls).toEqual(["stopped:pausing", "slow:pausing", "stopped:resuming", "slow:resuming"]);
+    expect(await resumeEvents(agent.id)).toHaveLength(1);
   });
 
   it("gives the board a route out of a pause that cannot finish", async () => {

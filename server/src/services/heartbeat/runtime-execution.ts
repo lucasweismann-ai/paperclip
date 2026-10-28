@@ -807,6 +807,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchWithTiming(
           async (markDispatchStarted) => {
             await input.effects.onLegacyAdapterEntered();
+            const admitted = await getRun(run.id, { includeExecutionEvidence: true });
+            if (!admitted || isHeartbeatRunTerminalStatus(admitted.status)
+              || admitted.resultJson?.cancellation || admitted.resultJson?.startupCancellation) {
+              return { exitCode: null, signal: null, timedOut: false,
+                executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } };
+            }
             return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,

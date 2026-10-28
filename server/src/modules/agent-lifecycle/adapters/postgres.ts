@@ -109,7 +109,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
       next === "resuming" ? "paused" : "idle",
       next === "resuming" ? "idle" : next === "pausing" ? "paused" : "terminated");
   }
-  if (command === "abort") await effects.recordStatus(tx, agent.companyId, agent.id, "paused", status);
+  if (command === "abort" && next !== "resuming") await effects.recordStatus(tx, agent.companyId, agent.id, "paused", status);
   return updated;
 }
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -162,6 +162,24 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(error);
     expect(await finalizations()).toMatchObject([{ status: "failed", metadata: { errorMessage: "provider failed" } }]);
     expect(input.effects.onLegacyAdapterEntered).toHaveBeenCalledOnce();
+    expectCleanup(input);
+  });
+
+  it.each([
+    ["terminates the run", async (runId: string) => {
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    }],
+    ["records a cancellation receipt while the run still reads running", async (runId: string) => {
+      await db.update(heartbeatRuns).set({ resultJson: { padding: randomBytes(192 * 1024).toString("hex"), cancellation: { requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, runId));
+    }],
+  ] as const)("skips the adapter handoff when a stop %s while the dispatch marker is written", async (_label, stop) => {
+    const { input, adapter, run } = await fixture();
+    input.effects.onLegacyAdapterEntered = vi.fn(async () => { await stop(run.id); });
+    await executeHeartbeatRuntime(db, input);
+    expect(input.effects.onLegacyAdapterEntered).toHaveBeenCalledOnce();
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expect(await read(run.id)).toMatchObject({ usageJson: { accountingProviderWorkStarted: false } });
+    expect(await db.select().from(runUsageReceipts)).toHaveLength(0);
     expectCleanup(input);
   });
 
