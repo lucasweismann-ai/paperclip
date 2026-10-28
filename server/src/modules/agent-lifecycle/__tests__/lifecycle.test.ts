@@ -55,8 +55,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Lifecycle test", issuePrefix: `L${companyId.slice(0, 7)}` });
   });
-  function worker(runHost: LifecycleDriver["runHost"] = async () => "complete") {
-    const value = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost });
+  function worker(runHost: LifecycleDriver["runHost"] = async () => "complete", driver: Partial<LifecycleDriver> = {}) {
+    const value = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost, ...driver });
     workers.push(value); return value;
   }
   async function hire(status = "idle") { return createAgentLifecycle(db).requestHire(companyId, { name: "Agent", status, adapterType: "process" }); }
@@ -556,6 +556,28 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleState).toBe("pausing");
     await expect(createAgentLifecycle(db).abortPause(agent.id)).rejects.toThrow("budget");
     expect((await current(agent.id)).lifecycleState).toBe("pausing");
+  });
+
+  it("restores stopped plugin resources through resuming when a part-paused agent is abandoned", async () => {
+    const agent = await readyAgent();
+    const [stopped, slow] = [randomUUID(), randomUUID()];
+    const calls: string[] = [];
+    const work = worker(async () => "complete", {
+      requiredPluginIds: async () => [stopped, slow],
+      runPlugin: async (paused, pluginId) => {
+        calls.push(`${pluginId === stopped ? "stopped" : "slow"}:${paused.lifecycleState}`);
+        return pluginId === slow && paused.lifecycleState === "pausing" ? "pending" : "complete";
+      },
+    });
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await work.process(agent.id);
+    const held = await current(agent.id);
+    expect(held.lifecycleState).toBe("pausing");
+    expect(held.lifecycleOperation).toMatchObject({ hostComplete: true, completedPluginIds: [stopped] });
+    expect(await createAgentLifecycle(db).abortPause(agent.id)).toMatchObject({ lifecycleState: "resuming" });
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle", pauseReason: null });
+    expect(calls).toEqual(["stopped:pausing", "slow:pausing", "stopped:resuming", "slow:resuming"]);
   });
 
   it("gives the board a route out of a pause that cannot finish", async () => {

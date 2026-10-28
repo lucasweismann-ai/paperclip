@@ -69,6 +69,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     : command === "resume" && holds.length ? agent.lifecycleState
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";
+  if (command === "abort" && agent.lifecycleOperation?.hostComplete && agent.lifecycleRequiredPluginIds?.length) next = "resuming";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
