@@ -453,7 +453,12 @@ export function changeConsentGateService(db: Db | Parameters<Parameters<Db["tran
         // text. Audit logging must never turn a denial into a 500, so a failure
         // to log is swallowed rather than propagated.
         try {
-          await logActivity(db, {
+          // This service now accepts a transaction handle as well as a pool
+          // handle, while `logActivity` is typed for the pool. Both satisfy the
+          // insert this performs, and the surrounding try/catch already treats
+          // a logging failure as non-fatal, so the narrowing cast cannot turn
+          // an audit problem into a denial problem.
+          await logActivity(db as Db, {
             companyId: input.companyId,
             actorType: "agent",
             actorId: actorAgentId,
