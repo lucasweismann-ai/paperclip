@@ -2,7 +2,7 @@ import { createAgentLifecycle, configureAgentLifecycle } from "../services/agent
 import fs from "node:fs/promises";
 import { fileHash } from "../services/agent-file-store.js";
 import { stockHash } from "../services/managed-resource-drift.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1710,6 +1710,15 @@ describeEmbeddedPostgres("built-in agents", () => {
           key: `agent:${target.id}:instructions`,
           revisionId: "proposal-v1",
           label: "Target Coder AGENTS.md diff",
+          // Value binding: a change-consent card must state the end state it
+          // authorizes. Instruction cards commit to the content HASH rather
+          // than the content, so the card payload stays bounded and no
+          // instruction text lands in the audit log.
+          proposedValues: {
+            op: "upsert",
+            path: "AGENTS.md",
+            contentSha256: createHash("sha256").update(acceptedInstructions, "utf8").digest("hex"),
+          },
         },
       },
     }, {
@@ -1766,6 +1775,13 @@ describeEmbeddedPostgres("built-in agents", () => {
           key: `agent:${target.id}:instructions`,
           revisionId: "proposal-v2",
           label: "Target Coder AGENTS.md rejected diff",
+          proposedValues: {
+            op: "upsert",
+            path: "AGENTS.md",
+            contentSha256: createHash("sha256")
+              .update(`${acceptedInstructions}\nThis rejected line must not be applied.\n`, "utf8")
+              .digest("hex"),
+          },
         },
       },
     }, {
