@@ -5728,6 +5728,26 @@ export function agentRoutes(
     res.json(redactAgentRowForResponse(agent));
   });
 
+  // `retry` only re-claims the operation; it cannot help a step that answers
+  // "pending" forever. Abandoning the pause is the supported way out, and it is
+  // reversible: the pause can be requested again once the obstacle is cleared.
+  router.post("/agents/:id/lifecycle/abort", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) return;
+    await assertCanConfigureAgentSetup(req, existing);
+    const agent = await svcLifecycle.abortPause(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    if (agent.lifecycleState === "ready") await heartbeat.resumeQueuedRunsForAgent(agent.companyId, agent.id);
+    const actor = getActorInfo(req);
+    await logActivity(db, { companyId: agent.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
+      action: "agent.lifecycle_aborted", entityType: "agent", entityId: agent.id,
+      details: { abandonedState: "pausing", lifecycleState: agent.lifecycleState } });
+    res.json(redactAgentRowForResponse(agent));
+  });
+
   router.post("/agents/:id/pause", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;

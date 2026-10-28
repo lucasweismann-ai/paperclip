@@ -36,7 +36,18 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
       lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'leaseOwner' - 'leaseUntil'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
     return updated;
   }
-  if (command === "resume" && !["ready", "paused", "pausing", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
+  if (command === "abort") {
+    // The operator route out of a transient state that cannot finish. It only
+    // abandons work that is safe to redo, and never substitutes for a proof.
+    // A hold the operator did not place would be re-imposed immediately, so the
+    // hold has to be cleared through its own path first.
+    if (agent.lifecycleState !== "pausing") throw new AgentLifecycleConflict(`Cannot abort an agent in state ${agent.lifecycleState}`);
+    const retained = agent.lifecycleHolds.filter(hold => hold !== "manual");
+    if (retained.length) throw new AgentLifecycleConflict(`Clear this agent's ${retained.join(", ")} hold before abandoning its pause`);
+  }
+  // Resuming a pause in flight cannot move the agent, so it must say so rather
+  // than answering with an unchanged row.
+  if (command === "resume" && !["ready", "paused", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
   let holds = policyHolds ?? agent.lifecycleHolds;
   const reason = options.reason ?? "manual";
   if (command === "reconcile" && policyHolds === undefined) {
@@ -51,13 +62,14 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     if (company.status === "archived") holds.push("company_archived");
     if (company.status === "paused") holds.push("company_paused");
   }
+  if (command === "abort") holds = [];
   if (command === "pause") holds = [...new Set([...holds, reason])];
   if (command === "resume") holds = holds.filter(hold => reason === "user" ? ["budget", "company_archived", "company_paused"].includes(hold) : hold !== reason);
   const blockingHolds = holds.filter(hold => hold !== "setup" || !["preparing", "verifying"].includes(agent.lifecycleState));
   let next = command === "reconcile"
     ? blockingHolds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
       : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
-    : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
+    : command === "resume" && holds.length ? agent.lifecycleState
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
@@ -99,6 +111,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
       next === "resuming" ? "paused" : "idle",
       next === "resuming" ? "idle" : next === "pausing" ? "paused" : "terminated");
   }
+  if (command === "abort") await effects.recordStatus(tx, agent.companyId, agent.id, "paused", status);
   return updated;
 }
 
@@ -177,11 +190,11 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
     },
-    async defer(agent, owner, error, now) {
+    async defer(agent, owner, error, now, options) {
       const rows = await db.update(agents).set({
-        lifecycleError: error,
+        ...(error === undefined ? {} : { lifecycleError: error }),
         lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil')
-          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()}::text)`,
+          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (options?.retryInMs ?? (error ? 60_000 : 2_000))).toISOString()}::text)`,
         updatedAt: now,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
