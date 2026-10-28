@@ -42,8 +42,6 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           if (!await runStep("renew", () => store.renew(agent, owner, new Date()))) continue;
           const host = await runStep("host", () => driver.runHost(agent));
           if (host === "pending" || typeof host === "object") {
-            // Record the obstacle without slowing the retry: a host step that is
-            // merely slow must still complete as soon as it can.
             const reason = typeof host === "object" ? host.reason : undefined;
             if (!await runStep("defer", () => store.defer(agent, owner, reason, new Date(), { retryInMs: 2_000 }))) continue;
             return;

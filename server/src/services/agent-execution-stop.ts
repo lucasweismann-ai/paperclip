@@ -8,9 +8,6 @@ import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { isCancelledBeforeProviderDispatch } from "./cancelled-pre-dispatch-stop.js";
 import { hasLegacyExecutionSettlement } from "./legacy-execution-settlement.js";
 
-/** Why an agent's executions cannot yet be certified as stopped. One entry per
- * offending row: a short-circuiting answer hides a wedge behind the first
- * offender and makes the remaining ones invisible to an operator. */
 export type ExecutionStopBlocker = {
   reason: "environment_lease_retained" | "coordinator_lease_live" | "coordinator_controller_live"
     | "run_not_terminal" | "controller_lease_live" | "remote_termination_unreceipted"
@@ -25,7 +22,7 @@ const absent = (pid: number) => {
 };
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
-async function inspect(db: Db, agentIds: string[]) {
+async function inspect(db: Db, agentIds: string[], options: { stopAtFirstBlocker?: boolean } = {}) {
   const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const leases = await db.select().from(environmentLeases).where(or(
@@ -39,17 +36,21 @@ async function inspect(db: Db, agentIds: string[]) {
   const blockers: ExecutionStopBlocker[] = [];
   const block = (reason: ExecutionStopBlocker["reason"], runId?: string | null, leaseId?: string) =>
     blockers.push({ reason, ...(runId ? { runId } : {}), ...(leaseId ? { leaseId } : {}) });
+  const halt = () => Boolean(options.stopAtFirstBlocker) && blockers.length > 0;
   for (const lease of leases) {
+    if (halt()) return { blockers, abandoned, now };
     if ((!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) ||
       lease.status === "pending_cleanup" || lease.cleanupStatus === "failed") {
       block("environment_lease_retained", lease.heartbeatRunId, lease.id);
     }
   }
   for (const row of abandoned) {
+    if (halt()) return { blockers, abandoned, now };
     if (!row.leaseExpiresAt || row.leaseExpiresAt > now || row.resultId ||
       runs.find(run => run.id === row.runId)?.status !== "cancelled") block("coordinator_lease_live", row.runId);
   }
   for (const coordinator of abandoned) {
+    if (halt()) return { blockers, abandoned, now };
     if (!coordinator.controllerPid || absent(coordinator.controllerPid)) continue;
     const observed = await readProcessStartedAt(coordinator.controllerPid).catch(() => null);
     if (!observed || !coordinator.controllerProcessStartedAt ||
@@ -58,6 +59,7 @@ async function inspect(db: Db, agentIds: string[]) {
     }
   }
   for (const run of runs) {
+    if (halt()) return { blockers, abandoned, now };
     if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) {
       block("run_not_terminal", run.id);
       continue;
@@ -98,14 +100,11 @@ async function inspect(db: Db, agentIds: string[]) {
   return { blockers, abandoned, now };
 }
 
-/** Read-only diagnosis. Reports every offending row so an operator can see the
- * whole set rather than repairing one row at a time. */
 export async function listAgentExecutionStopBlockers(db: Db, agentIds: string[]): Promise<ExecutionStopBlocker[]> {
   if (!agentIds.length) return [];
   return (await inspect(db, agentIds)).blockers;
 }
 
-/** One readable line for an operator, grouped by reason and bounded in length. */
 export function describeExecutionStopBlockers(blockers: ExecutionStopBlocker[]): string {
   const reasons = new Map<string, string[]>();
   for (const blocker of blockers) {
@@ -123,7 +122,7 @@ export function describeExecutionStopBlockers(blockers: ExecutionStopBlocker[]):
 
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   if (!agentIds.length) return true;
-  const { blockers, abandoned, now } = await inspect(db, agentIds);
+  const { blockers, abandoned, now } = await inspect(db, agentIds, { stopAtFirstBlocker: true });
   if (blockers.length) return false;
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {

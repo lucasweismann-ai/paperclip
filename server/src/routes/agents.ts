@@ -842,7 +842,6 @@ export function agentRoutes(
     { secretId: string; secretName: string; accountHomeDir: string; companyIdentityDiffers: boolean }
   >();
 
-
   const adapterLoginService = createDeviceLoginService({
     store: adapterLoginStore,
     runtime: createProductionLoginSessionRuntime({
@@ -5728,9 +5727,6 @@ export function agentRoutes(
     res.json(redactAgentRowForResponse(agent));
   });
 
-  // `retry` only re-claims the operation; it cannot help a step that answers
-  // "pending" forever. Abandoning the pause is the supported way out, and it is
-  // reversible: the pause can be requested again once the obstacle is cleared.
   router.post("/agents/:id/lifecycle/abort", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;

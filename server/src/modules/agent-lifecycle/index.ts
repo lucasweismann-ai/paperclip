@@ -95,7 +95,6 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
     resumeAgent: (id: string, reason = "user") => change(id, "resume", reason),
     terminateAgent: (id: string) => change(id, "terminate"),
     retry: (id: string) => change(id, "retry"),
-    /** Abandon a pause that cannot finish, without touching the database. */
     abortPause: (id: string) => change(id, "abort"),
     clearError: records.clearError,
     purgeAgent: (id: string) => purgeAgent(db, effects, id),

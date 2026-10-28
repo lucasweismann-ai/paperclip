@@ -37,16 +37,13 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     return updated;
   }
   if (command === "abort") {
-    // The operator route out of a transient state that cannot finish. It only
-    // abandons work that is safe to redo, and never substitutes for a proof.
-    // A hold the operator did not place would be re-imposed immediately, so the
-    // hold has to be cleared through its own path first.
     if (agent.lifecycleState !== "pausing") throw new AgentLifecycleConflict(`Cannot abort an agent in state ${agent.lifecycleState}`);
+    if (agent.lifecycleOperation?.leaseUntil && Date.parse(agent.lifecycleOperation.leaseUntil) > Date.now()) {
+      throw new AgentLifecycleConflict("A stop attempt is in flight for this agent; retry the abort once that attempt yields");
+    }
     const retained = agent.lifecycleHolds.filter(hold => hold !== "manual");
     if (retained.length) throw new AgentLifecycleConflict(`Clear this agent's ${retained.join(", ")} hold before abandoning its pause`);
   }
-  // Resuming a pause in flight cannot move the agent, so it must say so rather
-  // than answering with an unchanged row.
   if (command === "resume" && !["ready", "paused", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
   let holds = policyHolds ?? agent.lifecycleHolds;
   const reason = options.reason ?? "manual";

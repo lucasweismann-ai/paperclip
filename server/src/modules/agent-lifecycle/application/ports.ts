@@ -20,16 +20,11 @@ export interface LifecycleStore {
   setRequiredPlugins(agent: LifecycleAgent, owner: string, pluginIds: string[]): Promise<boolean>;
   completeHost(agent: LifecycleAgent, owner: string): Promise<boolean>;
   completePlugin(agent: LifecycleAgent, owner: string, pluginId: string): Promise<boolean>;
-  /** `undefined` keeps the recorded error; `null` clears it. */
   defer(agent: LifecycleAgent, owner: string, error: string | null | undefined, now: Date,
     options?: { retryInMs?: number }): Promise<boolean>;
   pending(limit: number, now: Date): Promise<string[]>;
 }
 
-/** A step that cannot finish yet may name the obstacle. An operation that
- * defers forever with no reason is indistinguishable from one making progress.
- * A bare `"pending"` supplies no reason and leaves the recorded one in place,
- * so naming the obstacle need not be repeated on every attempt. */
 export type LifecycleHostResult = "complete" | "pending" | { status: "pending"; reason: string | null };
 
 export interface LifecycleDriver {

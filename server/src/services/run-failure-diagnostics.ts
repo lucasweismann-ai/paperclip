@@ -241,8 +241,6 @@ export function collectRunFailureDiagnostics(run: Run, options: RunFailureReport
   if (typeof originalFailureCode === "string" && /^[a-z][a-z0-9_]{1,99}$/.test(originalFailureCode)) {
     execution.originalFailureCode = originalFailureCode;
   }
-  // Settlement is reported next to the stage the run reached rather than in
-  // place of it, so a cancelled run can still say whether it claimed dispatch.
   const settlement = readLegacyExecutionSettlement(run);
   if (settlement) execution.settledAt = settlement.settledAt;
   if (run.startedAt && run.finishedAt) {

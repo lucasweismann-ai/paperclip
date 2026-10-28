@@ -5,17 +5,14 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">;
 
-/** Every executor commits one of these before a provider turn can begin, and a
- * relayed provider event carries a sourceEventId. Their absence is therefore
- * durable proof that dispatch never started; a missing PID alone is not. */
+export const LEGACY_ADAPTER_ENTERED = "legacy.adapter_entered";
+
 export const PROVIDER_DISPATCH_EVENT_TYPES = [
-  "adapter.invoke", PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
+  "adapter.invoke", LEGACY_ADAPTER_ENTERED, PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
   "harness.ready", "session.started", "session.resumed", "session.updated", "turn.started",
   "provider.event", "provider.rpc_result", "tool.execution.started",
 ];
 
-/** Retained execution evidence, including a crash after a launch request but
- * before the PID callback. Provider events never certify a stop. */
 export async function hasProviderDispatchEvidence(db: Db, run: Run): Promise<boolean> {
   const [execution] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
@@ -31,7 +28,6 @@ export function readRunEnvironmentLeases(db: Db, run: Run) {
   ));
 }
 
-/** A lease still holding resources is retained evidence whatever the run row says. */
 export function leaseRetainsResources(lease: typeof environmentLeases.$inferSelect): boolean {
   return lease.provider === "local"
     ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"

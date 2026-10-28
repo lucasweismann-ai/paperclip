@@ -27,8 +27,6 @@ describe("legacy execution settlement receipts", () => {
     expect(hasLegacyExecutionSettlement({ resultJson: stale, executionStage: "dispatching" })).toBe(false);
   });
 
-  // A row settled by an older build cannot answer this, and a caller that needs
-  // certainty must fall back to run events rather than read the absence as "no".
   it.each([
     ["dispatching", true],
     ["preparing", false],
@@ -79,7 +77,6 @@ const support = await getEmbeddedPostgresTestSupport();
     return run!;
   }
 
-  /** The statement the owning executor runs once its cleanup has finished. */
   async function settle(settledAt = new Date()) {
     await db.update(heartbeatRuns).set({
       resultJson: legacyExecutionSettlementReceipt(settledAt, bootId),
@@ -94,8 +91,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const settledAt = new Date();
     await settle(settledAt);
     const settled = await read(run.id);
-    // The defect: this column used to read "settled", so the row could no
-    // longer say whether it had claimed dispatch before it was cancelled.
     expect(settled.executionStage).toBe("dispatching");
     expect(settled.controllerLeaseExpiresAt).toBeNull();
     expect(readLegacyExecutionSettlement(settled)).toEqual({
@@ -120,7 +115,6 @@ const support = await getEmbeddedPostgresTestSupport();
       const settled = await read(run.id);
       expect(settled.executionStage).toBe("dispatching");
       expect(hasLegacyExecutionSettlement(settled)).toBe(run.status === "cancelled");
-      // The lease is released for every terminal row either way.
       expect(settled.controllerLeaseExpiresAt).toBeNull();
     }
   });
@@ -132,8 +126,6 @@ const support = await getEmbeddedPostgresTestSupport();
     await settle(again);
     const settled = await read(run.id);
     expect(settled.resultJson).toMatchObject({ startupCancellation: { beforeNativeSelection: false }, stopReason: "operator" });
-    // Idempotent in the only way that matters: the stage it reports is read
-    // from the column each time, so a second pass cannot degrade it.
     expect(readLegacyExecutionSettlement(settled)).toEqual({
       settledAt: again.toISOString(), controllerBootId: bootId, stage: "dispatching",
     });

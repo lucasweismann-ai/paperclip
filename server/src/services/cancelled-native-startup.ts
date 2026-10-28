@@ -59,6 +59,5 @@ export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Co
   const leases = await readRunEnvironmentLeases(db, run);
   if ((!settled && leases.length === 0 && !historicalBeforeSelection) ||
     leases.some(leaseRetainsResources)) return false;
-  // Reject contradictory retained evidence.
   return !await hasProviderDispatchEvidence(db, run);
 }

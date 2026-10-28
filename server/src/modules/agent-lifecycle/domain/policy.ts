@@ -37,8 +37,6 @@ export function transition(state: AgentLifecycleState, command: LifecycleCommand
     if (state === "ready" || state === "resuming") return state;
     if (state === "paused") return "resuming";
   } else if (command === "abort") {
-    // Abandoning an unfinished pause is reversible: the pause can be requested
-    // again. Termination is a one-way door and must complete instead.
     if (state === "pausing") return resumeState;
   } else if (command === "complete") {
     switch (state) {

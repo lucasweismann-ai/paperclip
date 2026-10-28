@@ -8,8 +8,6 @@ import { agentHarnessVerificationService } from "./agent-harness-verification.js
 import { agentInstanceSecretService } from "./agent-instance-secrets.js";
 import { describeExecutionStopBlockers, listAgentExecutionStopBlockers } from "./agent-execution-stop.js";
 
-/** Attempts a stop step may consume before the obstacle is worth naming. The
- * retry cadence is ~2s, so a healthy drain finishes well inside this. */
 export const STOP_DIAGNOSIS_ATTEMPTS = 15;
 
 export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): LifecycleDriver {
@@ -56,9 +54,6 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
         const reason = agent.lifecycleHolds?.includes("company_archived")
           ? "Cancelled because the company was archived" : "Agent lifecycle stop requested";
         if (!await heartbeat.stopInvocationsForAgents(ids, reason)) {
-          // Diagnose only once the drain looks stuck, then refresh periodically.
-          // The recorded reason survives the attempts in between, so a stalled
-          // operation costs one extra scan per interval rather than one per retry.
           const attempts = agent.lifecycleOperation?.attempts ?? 0;
           if (attempts < STOP_DIAGNOSIS_ATTEMPTS || attempts % STOP_DIAGNOSIS_ATTEMPTS !== 0) return "pending";
           const blockers = await listAgentExecutionStopBlockers(db, ids);

@@ -9,6 +9,7 @@ import { requireServerAdapter } from "../../../adapters/index.js";
 import { agentExecutionsHaveStopped, describeExecutionStopBlockers, listAgentExecutionStopBlockers } from "../../../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
 import { LEGACY_EXECUTION_SETTLEMENT_KEY, LEGACY_EXECUTION_SETTLEMENT_SCHEMA } from "../../../services/legacy-execution-settlement.js";
+import { LEGACY_ADAPTER_ENTERED } from "../../../services/run-dispatch-evidence.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
 import { agentService as agentConfiguration } from "../../../services/agents.js";
@@ -194,9 +195,6 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(agent).not.toHaveProperty("lifecycleOperation");
   });
 
-
-
-
   it("freezes the final setup configuration for hire approval", async () => {
     const lifecycle = createAgentLifecycle(db);
     const id = randomUUID();
@@ -216,7 +214,6 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await expect(lifecycle.requestHire(companyId, { name: "Paused" }, { setupAgentId: paused.id })).rejects.toThrow("no longer available");
     expect((await current(setup.id)).lifecycleHolds).toEqual(["setup"]);
   });
-
 
   it("creates a board-owned setup before requesting approval for its final configuration", async () => {
     await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
@@ -432,18 +429,12 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleState).toBe("terminated");
   });
 
-  // A conversation-adapter run cancelled before its PID was recorded can never
-  // earn an acknowledged-cancellation receipt, and both remaining escape
-  // hatches are closed to it, so one such row used to block every later pause.
   const unrecordedCancellation = (agentId: string, executionStage: string, resultJson?: Record<string, unknown>) => ({
     companyId, agentId, status: "cancelled", invocationSource: "on_demand" as const,
     runtimeMode: "legacy", executionStage, startedAt: new Date(), finishedAt: new Date(),
     resultJson: (resultJson ?? null) as never,
     runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } } as never,
   });
-  // An executor's own cleanup used to record itself by overwriting the stage
-  // with `settled`; it now leaves the stage alone and writes a receipt. Both
-  // forms must keep admitting the rows they already admitted.
   const settlementReceipt = {
     [LEGACY_EXECUTION_SETTLEMENT_KEY]: {
       schema: LEGACY_EXECUTION_SETTLEMENT_SCHEMA, settledAt: new Date().toISOString(),
@@ -465,10 +456,26 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await createAgentLifecycle(db).pauseAgent(agent.id);
     await work.process(agent.id);
     expect((await current(agent.id)).lifecycleState).toBe("paused");
-    // Dispatch evidence retains the hold; the adapter and the stage never did.
     await db.insert(heartbeatRunEvents).values({ companyId, runId: run.id, agentId: agent.id, seq: 1, eventType: "adapter.invoke" });
     expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
   });
+
+  it.each(["http", "hermes_local", "claude_local"])(
+    "holds the stop when a cancelled %s run recorded entering its adapter", async (adapterType) => {
+      const agent = await readyAgent();
+      const [run] = await db.insert(heartbeatRuns).values({
+        ...unrecordedCancellation(agent.id, "preparing"),
+        runnerProfileJson: { adapterDispatch: { adapterType } } as never,
+      }).returning();
+      await db.insert(heartbeatRunEvents).values({
+        companyId, runId: run.id, agentId: agent.id, seq: 1, eventType: LEGACY_ADAPTER_ENTERED,
+      });
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+      const work = worker(createLifecycleDriver(db, {} as never).runHost);
+      await createAgentLifecycle(db).pauseAgent(agent.id);
+      await work.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("pausing");
+    });
 
   it("reports every execution that blocks a stop, not only the first", async () => {
     const agent = await readyAgent();
@@ -501,11 +508,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(diagnosed.lifecycleState).toBe("pausing");
     expect(diagnosed.lifecycleError).toContain("process_alive");
     expect(diagnosed.lifecycleError).toContain(run.id);
-    // Naming the obstacle must not slow a stop that is merely taking its time.
     const retryAt = (diagnosed.lifecycleOperation as { retryAt?: string } | null)?.retryAt;
     expect(Date.parse(retryAt!) - Date.now()).toBeLessThan(30_000);
-    // The reason survives the attempts between refreshes, so a stalled stop
-    // costs one extra scan per interval rather than one on every retry.
     await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
     await work.process(agent.id);
     expect((await current(agent.id)).lifecycleError).toBe(diagnosed.lifecycleError);
@@ -523,6 +527,25 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(aborted).toMatchObject({ lifecycleState: "ready", status: "idle", pauseReason: null });
     expect((await current(agent.id)).pausedAt).toBeNull();
     await expect(createAgentLifecycle(db).abortPause(agent.id)).rejects.toThrow("Cannot abort an agent in state ready");
+  });
+
+  it("refuses to abandon a pause while a stop attempt still holds the lifecycle lease", async () => {
+    const agent = await readyAgent();
+    const work = worker(async () => "pending");
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleState).toBe("pausing");
+    const leaseUntil = JSON.stringify(new Date(Date.now() + 60_000).toISOString());
+    await db.update(agents).set({
+      lifecycleOperation: sql`jsonb_set(jsonb_set(${agents.lifecycleOperation},
+        '{leaseOwner}', '"another-controller"'::jsonb), '{leaseUntil}', ${leaseUntil}::jsonb)`,
+    }).where(eq(agents.id, agent.id));
+    await expect(createAgentLifecycle(db).abortPause(agent.id)).rejects.toThrow("stop attempt is in flight");
+    expect((await current(agent.id)).lifecycleState).toBe("pausing");
+    await db.update(agents).set({
+      lifecycleOperation: sql`${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil'`,
+    }).where(eq(agents.id, agent.id));
+    expect(await createAgentLifecycle(db).abortPause(agent.id)).toMatchObject({ lifecycleState: "ready" });
   });
 
   it("keeps a policy hold through an abort so the pause is not abandoned twice", async () => {

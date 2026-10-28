@@ -226,7 +226,6 @@ import { decisionModelService } from "./decision-models.js";
 import { TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 
-
 import {
   startupCancellationFence,
 } from "./native-runtime/native-cancellation-request.js";
@@ -262,7 +261,7 @@ import {
 } from "./legacy-controller-lease.js";
 
 import { legacyExecutionSettlementReceipt } from "./legacy-execution-settlement.js";
-
+import { LEGACY_ADAPTER_ENTERED } from "./run-dispatch-evidence.js";
 
 import {
   prepareManagedAiRuntime,
@@ -493,9 +492,7 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
 } from "./agent-invokability.js";
 
-
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
-
 
 import { environmentService } from "./environments.js";
 
@@ -3441,10 +3438,17 @@ export function heartbeatService(
           effects: {
             onUsageCaptureReady: (value) => { persistUsageCaptureFailure = value; },
             onNativeDispatchStarted: () => { nativeDispatchStarted = true; },
-            onLegacyAdapterEntered: () => {
+            onLegacyAdapterEntered: async () => {
               legacyAdapterEntered = true;
               legacyLocalAdapterEntered = legacyAdapterNeedsLocalProcessSettlement({
                 adapterType: adapter.type, executionTargetKind: executionTarget?.kind,
+              });
+              await appendRunEvent(run, {
+                eventType: LEGACY_ADAPTER_ENTERED,
+                stream: "system",
+                level: "info",
+                message: "legacy adapter entered",
+                payload: { adapterType: adapter.type, executionTargetKind: executionTarget?.kind ?? "local" },
               });
             },
             onNativeWorkspaceFinalizeScheduled: () => { nativeWorkspaceFinalizeScheduled = true; },
@@ -3880,13 +3884,6 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "failed to release settled native process identity");
           });
         }
-        // Record settlement as its own receipt. Overwriting `execution_stage`
-        // with `settled` here destroyed the dispatch claim, which is committed
-        // before adapter bootstrap and so precedes both the first run event and
-        // the PID write — the only evidence covering that window. It also made
-        // every gate that reads `preparing` unsatisfiable for a run this
-        // executor cancelled, and left `settled` unable to distinguish a run
-        // that reached dispatch from one that never did.
         await db.update(heartbeatRuns).set({
           resultJson: legacyExecutionSettlementReceipt(new Date(), legacyControllerBootId),
           controllerLeaseExpiresAt: null,
