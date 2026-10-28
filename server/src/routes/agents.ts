@@ -51,7 +51,7 @@ import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js"
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
-import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -2560,17 +2560,12 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  async function assertCanManageInstructionsPath(
-    req: Request,
-    targetAgent: { id: string; companyId: string },
-    proposedValues: Record<string, unknown> | null,
-  ) {
-    const targetKey = agentInstructionsChangeTargetKey(targetAgent.id);
+  async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
     await assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
-      [targetKey],
-      proposedValues ? consentValueDigest(targetKey, proposedValues) : null,
+      [agentInstructionsChangeTargetKey(targetAgent.id)],
+      null,
       false,
     );
   }
@@ -5015,7 +5010,7 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
-    await assertCanManageInstructionsPath(req, existing, null);
+    await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
@@ -5117,7 +5112,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing, { ...(req.body as Record<string, unknown>) });
+    await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
     if (req.body.mode === "external") assertInstanceAdmin(req);
 
@@ -5201,19 +5196,13 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    const instructionsProposedValues = {
-      op: "upsert" as const,
-      path: req.body.path,
-      contentSha256: createHash("sha256").update(req.body.content ?? "", "utf8").digest("hex"),
-      clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate === true,
-    };
     const entryFile = deriveBundleState(existing).entryFile;
     if (instructionPath(req.body.path) === entryFile) {
       assertExternalInstructionsAdmin(req, existing);
       if (req.body.baseHash !== undefined) req.body.baseRevisionId = req.body.baseHash === null ? null : agentFileTokenFromHash(req.body.baseHash);
       if (req.body.baseRevisionId === undefined) throw unprocessable("Read the entry and supply baseRevisionId (null for a new entry)", { code: "INSTRUCTION_BASE_REQUIRED" });
       // Clearing legacy prompt configuration remains a protected config change.
-      if (req.body.clearLegacyPromptTemplate) await assertCanManageInstructionsPath(req, existing, instructionsProposedValues);
+      if (req.body.clearLegacyPromptTemplate) await assertCanManageInstructionsPath(req, existing);
       const receipt = await instructionRevisions.commit({ companyId: existing.companyId, agentId: existing.id,
         entryFile, content: req.body.content, baseRevisionId: req.body.baseRevisionId,
         source: req.actor.type === "board" ? "board" : "api" }, req.actor);
@@ -5234,7 +5223,7 @@ export function agentRoutes(
       res.json(instructionFileDetail(receipt, receipt));
       return;
     }
-    await assertCanManageInstructionsPath(req, existing, instructionsProposedValues);
+    await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
@@ -5348,14 +5337,14 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    await assertCanManageInstructionsPath(req, existing);
+    assertExternalInstructionsAdmin(req, existing);
+
     const relativePath = typeof req.query.path === "string" ? req.query.path : "";
     if (!relativePath.trim()) {
       res.status(422).json({ error: "Query parameter 'path' is required" });
       return;
     }
-
-    await assertCanManageInstructionsPath(req, existing, { op: "delete", path: relativePath });
-    assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed") {
       const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
@@ -5363,7 +5352,6 @@ export function agentRoutes(
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor);
       res.json(await instructions.getBundle(existing)); return;
     }
-
     const actor = getActorInfo(req);
     const result = await instructions.deleteFile(existing, relativePath);
     await logActivity(db, {
@@ -5467,7 +5455,7 @@ export function agentRoutes(
       assertNoAgentAdapterConfigMutation(req, adapterConfig);
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
-        await assertCanManageInstructionsPath(req, existing, null);
+        await assertCanManageInstructionsPath(req, existing);
       }
       patchData.adapterConfig = adapterConfig;
     }
@@ -5526,16 +5514,14 @@ export function agentRoutes(
       const requestedAdapterConfig = hasOwn(patchData, "adapterConfig")
         ? (asRecord(patchData.adapterConfig) ?? {})
         : null;
-      const clearedInstructionsBundleKeys = requestedAdapterConfig && replaceAdapterConfig
-        ? KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) =>
+      if (
+        requestedAdapterConfig
+        && replaceAdapterConfig
+        && KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) =>
           existingAdapterConfig[key] !== undefined && requestedAdapterConfig[key] === undefined,
         )
-        : [];
-      if (clearedInstructionsBundleKeys.length > 0) {
-        await assertCanManageInstructionsPath(req, existing, {
-          op: "clear-instructions-config",
-          clearedKeys: [...clearedInstructionsBundleKeys].sort(),
-        });
+      ) {
+        await assertCanManageInstructionsPath(req, existing);
       }
       let rawEffectiveAdapterConfig = requestedAdapterConfig
         ? restoreRedactedAgentEnv(requestedAdapterConfig, existingAdapterConfig)
