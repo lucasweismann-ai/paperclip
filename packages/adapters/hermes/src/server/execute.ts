@@ -53,6 +53,12 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import {
+  resolveStateDbPath,
+  readLedgerTotals,
+  readLedgerTotalsSettled,
+  diffLedgerTotals,
+} from "./ledger-usage.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -231,18 +237,9 @@ const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
 /** Regex for legacy session output format */
 const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
 
-/** Regex to extract token usage from Hermes output. */
-const TOKEN_USAGE_REGEX =
-  /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
-
-/** Regex to extract cost from Hermes output. */
-const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
-
 interface ParsedOutput {
   sessionId?: string;
   response?: string;
-  usage?: UsageSummary;
-  costUsd?: number;
   errorMessage?: string;
 }
 
@@ -309,20 +306,8 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     }
   }
 
-  // Extract token usage
-  const usageMatch = combined.match(TOKEN_USAGE_REGEX);
-  if (usageMatch) {
-    result.usage = {
-      inputTokens: parseInt(usageMatch[1], 10) || 0,
-      outputTokens: parseInt(usageMatch[2], 10) || 0,
-    };
-  }
-
-  // Extract cost
-  const costMatch = combined.match(COST_REGEX);
-  if (costMatch?.[1]) {
-    result.costUsd = parseFloat(costMatch[1]);
-  }
+  // Usage and cost are NOT parsed from stdout. They come from Hermes' own
+  // ledger via ledger-usage.ts; see the comment there for why.
 
   // Check for error patterns in stderr
   if (stderr.trim()) {
@@ -582,6 +567,11 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
+  // Baseline the ledger before the child starts: a resumed session's rows
+  // accumulate, so only the growth belongs to this run.
+  const stateDbPath = resolveStateDbPath(config, env);
+  const ledgerBefore = prevSessionId ? readLedgerTotals(prevSessionId, stateDbPath) : null;
+
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
@@ -617,12 +607,40 @@ export async function execute(
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
   }
 
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
-  }
+  // ── Usage and cost, from Hermes' ledger ────────────────────────────────
+  const ledgerAfter = await readLedgerTotalsSettled(parsed.sessionId, stateDbPath, ledgerBefore);
+  const ledgerDelta = diffLedgerTotals(ledgerBefore, ledgerAfter);
 
-  if (parsed.costUsd !== undefined) {
-    executionResult.costUsd = parsed.costUsd;
+  if (ledgerDelta) {
+    const usage: UsageSummary = {
+      inputTokens: ledgerDelta.inputTokens,
+      cachedInputTokens: ledgerDelta.cachedInputTokens,
+      outputTokens: ledgerDelta.outputTokens,
+    };
+    executionResult.usage = usage;
+    // Report a cost only when the ledger priced the usage. Leaving costUsd
+    // unset makes Paperclip record the row as unpriced, which is honest;
+    // sending 0 would read as "this run was free".
+    if (ledgerDelta.priced) {
+      executionResult.costUsd = ledgerDelta.costUsd;
+      executionResult.billingType = "metered_api";
+    }
+    const costLabel = ledgerDelta.priced ? `$${ledgerDelta.costUsd.toFixed(6)}` : "UNPRICED";
+    const unpricedNote = ledgerDelta.unpriced
+      ? ` (unpriced models: ${ledgerDelta.unpricedModels.join(", ")})`
+      : "";
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Metered from ledger: ${ledgerDelta.inputTokens} in / ` +
+        `${ledgerDelta.cachedInputTokens} cached / ${ledgerDelta.outputTokens} out over ` +
+        `${ledgerDelta.apiCalls} call(s); cost ${costLabel}${unpricedNote}\n`,
+    );
+  } else {
+    await ctx.onLog(
+      "stderr",
+      `[hermes] Ledger unavailable for session ${parsed.sessionId ?? "(none)"} at ` +
+        `${stateDbPath} — this run is unmetered and spend totals will under-count.\n`,
+    );
   }
 
   // Summary from agent response
@@ -634,8 +652,17 @@ export async function execute(
   executionResult.resultJson = {
     result: parsed.response || "",
     session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
-    cost_usd: parsed.costUsd ?? null,
+    usage: ledgerDelta
+      ? {
+          inputTokens: ledgerDelta.inputTokens,
+          cachedInputTokens: ledgerDelta.cachedInputTokens,
+          outputTokens: ledgerDelta.outputTokens,
+        }
+      : null,
+    cost_usd: ledgerDelta?.priced ? ledgerDelta.costUsd : null,
+    cost_source: ledgerDelta ? (ledgerDelta.priced ? "hermes_ledger" : "unpriced") : "unavailable",
+    api_calls: ledgerDelta ? ledgerDelta.apiCalls : null,
+    unpriced_models: ledgerDelta ? ledgerDelta.unpricedModels : null,
   };
 
   // Store session ID for next run
