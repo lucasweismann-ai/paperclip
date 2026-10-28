@@ -229,7 +229,6 @@ type AcpxRuntimeFactory = (options: PaperclipAcpRuntimeOptions) => AcpRuntime;
  * fingerprint scoping the warm handle uses — so one session can never read
  * another session's staged credentials: a different agent/task/config hashes to
  * a different key, misses this cache, and stages its own home.
- *
  * Remote sessions are never held in the warm-handle cache (their agent process
  * lives behind a per-run process-session bridge, torn down each run and resumed
  * via `session/load`); the only thing that survives between their runs is the
@@ -2594,8 +2593,6 @@ async function buildRuntime(input: {
       runtimeEnv = finalizeLaunchEnvironment(env, [], {
         acpxAgent,
         inheritHostEnvironment: !useRemoteProcessSession,
-        // Only a launch on this host spawns the child from this env directly.
-        // An SSH target applies it onto a shell on the far side.
         materializesChildEnvironment: !executionTargetIsRemote,
       }).env;
     }
@@ -2784,16 +2781,6 @@ async function applySessionConfigOptions(input: {
  * get the closed projection plus a default `PATH` when the host did not provide
  * one. Runner-backed remote sandbox launches get no ambient host state or
  * synthesized host `PATH`; omitting `PATH` preserves the sandbox-native value.
- *
- * A launch that materializes the child environment on this host also resolves
- * the managed-AI neutralization: that env is the child's own, built here from a
- * closed projection, so a neutralized key belongs absent rather than empty.
- * Dropping it after the overlay removes the projected host value too, so the
- * override still holds. Every launch that ships this env somewhere else — a
- * runner-backed sandbox, an SSH shell — keeps the empty assignment, because it
- * is merged onto an environment this process does not own and absence there
- * would re-admit that environment's own value. The caller states which it is;
- * the default is the conservative one.
  */
 function resolveRuntimeEnv(
   env: Record<string, string>,
@@ -5929,6 +5916,5 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     }
   };
 }
-
 
 export const execute = createAcpxEngineExecutor();

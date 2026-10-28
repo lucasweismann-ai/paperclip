@@ -14,8 +14,6 @@ describe("managed AI environment neutralization", () => {
       ANTHROPIC_BEDROCK_BASE_URL: "",
       PATH: "/usr/bin",
     });
-    // An absent key is not the same thing as an empty one: a provider SDK that
-    // builds at module load defaults on absence and throws on "".
     expect("ANTHROPIC_BASE_URL" in resolved).toBe(false);
     expect("OPENAI_BASE_URL" in resolved).toBe(false);
     expect("XAI_BASE_URL" in resolved).toBe(false);
@@ -25,8 +23,6 @@ describe("managed AI environment neutralization", () => {
   });
 
   it("keeps a neutralized key the managed runtime gave a real value", () => {
-    // The runtime writes the neutralization first and then overwrites some of
-    // these keys with the values the child actually needs.
     const resolved = resolveNeutralizedManagedAiEnv({
       CLAUDE_CONFIG_DIR: "/tmp/managed/provider",
       ANTHROPIC_AUTH_TOKEN: "token-value",
@@ -38,8 +34,6 @@ describe("managed AI environment neutralization", () => {
   });
 
   it("leaves an empty value under any other key alone", () => {
-    // This speaks only for the managed-AI neutralization. An empty value a user
-    // configured for an unrelated key is still that user's choice.
     const resolved = resolveNeutralizedManagedAiEnv({
       SOME_PROJECT_FLAG: "",
       NO_PROXY: "",
@@ -49,8 +43,6 @@ describe("managed AI environment neutralization", () => {
   });
 
   it("covers every provider routing URL the neutralization writes", () => {
-    // The breakage was specific to URL-valued keys, so a future edit that drops
-    // one of these from the list must fail here rather than in a child process.
     for (const key of [
       "ANTHROPIC_BASE_URL",
       "OPENAI_BASE_URL",

@@ -30,11 +30,6 @@ export function isAiConnectionBusy(error: unknown): error is HttpError {
     (error.details as { code?: unknown } | undefined)?.code === "ai_connection_busy";
 }
 
-// Blank values intentionally override inherited credentials in CLI child
-// environments. The adapter engine recognizes that neutralization from the same
-// list and resolves it to an absent key where the launch environment it builds
-// IS the child's, so no descendant inherits an empty provider URL (see
-// `resolveNeutralizedManagedAiEnv`).
 export const AI_AUTH_ENV_KEYS = MANAGED_AI_NEUTRALIZED_ENV_KEYS;
 export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
   const result = {
