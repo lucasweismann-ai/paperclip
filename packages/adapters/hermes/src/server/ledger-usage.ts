@@ -17,13 +17,20 @@
  * while the real cost line (`**Cost:** ~$1.93 estimated`) did not match at all.
  * A seat could therefore set its own billed spend by typing the word "cost".
  *
- * Two invariants here are deliberate:
+ * Four invariants here are deliberate:
  *
  * - A session's rows accumulate across resumes, so a run is charged the
  *   *delta* against a baseline taken before the child starts.
  * - When the ledger has usage it could not price, tokens are reported with no
  *   cost at all rather than a cost of zero, so Paperclip records the row as
  *   `unpriced` instead of as a run that was free.
+ * - Pricing is judged on the models this run actually *grew*, not on the
+ *   session as a whole. A session that was priced yesterday must not make
+ *   today's unpriced run look like a run that cost nothing.
+ * - "The ledger says nothing yet" and "the ledger could not be read" are
+ *   different answers. Only the first is zero; the second is unknown, and a
+ *   run whose baseline is unknown is left unpriced rather than being charged
+ *   the whole session's history.
  */
 
 import { createRequire } from "node:module";
@@ -40,6 +47,16 @@ const PRICED_COST_STATUS = new Set(["actual", "estimated", "included"]);
 const SETTLE_ATTEMPTS = 6;
 const SETTLE_INTERVAL_MS = 250;
 
+/** One model's accumulated usage within a session. */
+export interface ModelUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  apiCalls: number;
+  /** Accumulated cost, or null when the row carries tokens with no usable price. */
+  costUsd: number | null;
+}
+
 /** Totals for one session, summed across every model it used. */
 export interface LedgerTotals {
   inputTokens: number;
@@ -52,6 +69,10 @@ export interface LedgerTotals {
   unpricedRows: number;
   /** Models whose rows recorded tokens but no usable price. */
   unpricedModels: string[];
+  /** Per-model breakdown, so a delta can tell which models actually moved. */
+  byModel: Record<string, ModelUsage>;
+  /** False when the ledger is readable but holds no rows for this session yet. */
+  hasRows: boolean;
 }
 
 /** What a single run consumed: the delta between two ledger reads. */
@@ -60,12 +81,33 @@ export interface LedgerDelta {
   cachedInputTokens: number;
   outputTokens: number;
   apiCalls: number;
+  /** Cost of the priced models this run grew. Partial when `unpriced` is true. */
   costUsd: number;
-  /** True when at least one row carried a usable price. */
+  /**
+   * True only when every model this run grew carried a usable price, so
+   * `costUsd` is the run's whole cost rather than part of it. Callers report a
+   * cost to Paperclip only on this flag.
+   */
   priced: boolean;
-  /** True when at least one row recorded tokens with no usable price. */
+  /** True when a model this run grew recorded tokens with no usable price. */
   unpriced: boolean;
   unpricedModels: string[];
+}
+
+/** A readable ledger holding nothing for this session: known zero, not unknown. */
+export function emptyLedgerTotals(): LedgerTotals {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    apiCalls: 0,
+    costUsd: 0,
+    pricedRows: 0,
+    unpricedRows: 0,
+    unpricedModels: [],
+    byModel: {},
+    hasRows: false,
+  };
 }
 
 interface UsageRow {
@@ -80,15 +122,25 @@ interface UsageRow {
   cost_status?: unknown;
 }
 
-/** Resolve Hermes' state database: explicit config, then HERMES_HOME, then ~/.hermes. */
+/**
+ * Resolve Hermes' state database: explicit config, then HERMES_HOME, then
+ * `<child HOME>/.hermes`.
+ *
+ * `env` must be the environment the child is actually launched with. A config
+ * that overrides HOME without setting HERMES_HOME moves Hermes' ledger with it,
+ * so reading `os.homedir()` here would meter the wrong database — or none.
+ * `os.homedir()` remains the fallback for when the child inherits our own HOME.
+ */
 export function resolveStateDbPath(
   config: Record<string, unknown> | undefined,
   env: Record<string, string | undefined> | undefined,
 ): string {
   const explicit = config?.hermesStateDb;
   if (typeof explicit === "string" && explicit.trim()) return explicit;
-  const home = env?.HERMES_HOME?.trim() || path.join(os.homedir(), ".hermes");
-  return path.join(home, "state.db");
+  const hermesHome = env?.HERMES_HOME?.trim();
+  if (hermesHome) return path.join(hermesHome, "state.db");
+  const home = env?.HOME?.trim() || os.homedir();
+  return path.join(home, ".hermes", "state.db");
 }
 
 /** Non-negative integer counter, or 0. Providers occasionally report nonsense. */
@@ -143,7 +195,10 @@ function loadSqlite(): SqliteModule | null {
  * Session totals from Hermes' ledger, or null when they cannot be read.
  *
  * Null means "unknown" and is never substituted with zeros: a run whose usage
- * is unknown must not be recorded as a run that used nothing.
+ * is unknown must not be recorded as a run that used nothing. A ledger that is
+ * readable but holds no rows for this session is a different answer — that is
+ * a known zero, returned as empty totals with `hasRows: false`, because a
+ * session which has not billed anything yet is not an unreadable ledger.
  */
 export function readLedgerTotals(
   sessionId: string | null | undefined,
@@ -165,36 +220,47 @@ export function readLedgerTotals(
           WHERE session_id = ?`,
       )
       .all(sessionId);
-    if (rows.length === 0) return null;
+    if (rows.length === 0) return emptyLedgerTotals();
 
-    const totals: LedgerTotals = {
-      inputTokens: 0,
-      cachedInputTokens: 0,
-      outputTokens: 0,
-      apiCalls: 0,
-      costUsd: 0,
-      pricedRows: 0,
-      unpricedRows: 0,
-      unpricedModels: [],
-    };
+    const totals = emptyLedgerTotals();
+    totals.hasRows = true;
 
     for (const row of rows) {
+      const model = String(row.model ?? "unknown");
       const input = counter(row.input_tokens);
       const cached = counter(row.cache_read_tokens) + counter(row.cache_write_tokens);
       const output = counter(row.output_tokens);
+      const apiCalls = counter(row.api_call_count);
       totals.inputTokens += input;
       totals.cachedInputTokens += cached;
       totals.outputTokens += output;
-      totals.apiCalls += counter(row.api_call_count);
+      totals.apiCalls += apiCalls;
 
-      const cost = rowCostUsd(row.actual_cost_usd, row.estimated_cost_usd);
-      if (cost !== null && PRICED_COST_STATUS.has(String(row.cost_status ?? ""))) {
+      const rawCost = rowCostUsd(row.actual_cost_usd, row.estimated_cost_usd);
+      const cost =
+        rawCost !== null && PRICED_COST_STATUS.has(String(row.cost_status ?? "")) ? rawCost : null;
+      if (cost !== null) {
         totals.costUsd += cost;
         totals.pricedRows += 1;
       } else if (input || cached || output) {
         totals.unpricedRows += 1;
-        totals.unpricedModels.push(String(row.model ?? "unknown"));
+        totals.unpricedModels.push(model);
       }
+
+      // The schema keys on (session_id, model), but accumulate defensively so a
+      // duplicated row cannot silently discard usage.
+      const perModel = (totals.byModel[model] ??= {
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        apiCalls: 0,
+        costUsd: null,
+      });
+      perModel.inputTokens += input;
+      perModel.cachedInputTokens += cached;
+      perModel.outputTokens += output;
+      perModel.apiCalls += apiCalls;
+      if (cost !== null) perModel.costUsd = (perModel.costUsd ?? 0) + cost;
     }
 
     return totals;
@@ -216,30 +282,64 @@ export function readLedgerTotals(
  * Hermes resumes sessions and its rows accumulate, so the difference -- not the
  * total -- is what the run should be charged. Deltas are clamped at zero: the
  * ledger only grows, and a negative delta would mean the baseline was wrong.
+ *
+ * Either read being null means "unknown", and the answer is null rather than a
+ * guess. In particular a null *baseline* is not treated as zero: on a resumed
+ * session a momentarily unreadable database would otherwise re-charge the
+ * entire session history to this one run. Callers starting a fresh session
+ * pass `emptyLedgerTotals()`, which says zero and means it.
+ *
+ * Pricing is decided per model, over the models this run actually grew. A model
+ * that did not move cannot make the run look priced, and a run that grew any
+ * unpriced model is reported unpriced -- `costUsd` then holds the part that is
+ * known, which is strictly less than the run's real cost.
  */
 export function diffLedgerTotals(
   before: LedgerTotals | null,
   after: LedgerTotals | null,
 ): LedgerDelta | null {
-  if (!after) return null;
-  const base = before ?? {
+  if (!after || !before) return null;
+
+  const grew = (now: unknown, was: unknown) => Math.max(0, counter(now) - counter(was));
+  const noUsage: ModelUsage = {
     inputTokens: 0,
     cachedInputTokens: 0,
     outputTokens: 0,
     apiCalls: 0,
-    costUsd: 0,
+    costUsd: null,
   };
-  const grew = (now: unknown, was: unknown) => Math.max(0, counter(now) - counter(was));
+
+  let costUsd = 0;
+  let anyPriced = false;
+  const unpricedModels: string[] = [];
+
+  for (const [model, now] of Object.entries(after.byModel)) {
+    const was = before.byModel[model] ?? noUsage;
+    const moved =
+      grew(now.inputTokens, was.inputTokens) +
+        grew(now.cachedInputTokens, was.cachedInputTokens) +
+        grew(now.outputTokens, was.outputTokens) +
+        grew(now.apiCalls, was.apiCalls) >
+      0;
+    if (!moved) continue;
+    if (now.costUsd === null) {
+      unpricedModels.push(model);
+    } else {
+      anyPriced = true;
+      costUsd += Math.max(0, now.costUsd - (was.costUsd ?? 0));
+    }
+  }
+
   return {
-    inputTokens: grew(after.inputTokens, base.inputTokens),
-    cachedInputTokens: grew(after.cachedInputTokens, base.cachedInputTokens),
-    outputTokens: grew(after.outputTokens, base.outputTokens),
-    apiCalls: grew(after.apiCalls, base.apiCalls),
+    inputTokens: grew(after.inputTokens, before.inputTokens),
+    cachedInputTokens: grew(after.cachedInputTokens, before.cachedInputTokens),
+    outputTokens: grew(after.outputTokens, before.outputTokens),
+    apiCalls: grew(after.apiCalls, before.apiCalls),
     // Costs are fractions of a cent, so round rather than floor.
-    costUsd: Math.max(0, Math.round((after.costUsd - base.costUsd) * 1e6) / 1e6),
-    priced: after.pricedRows > 0,
-    unpriced: after.unpricedRows > 0,
-    unpricedModels: [...new Set(after.unpricedModels)],
+    costUsd: Math.max(0, Math.round(costUsd * 1e6) / 1e6),
+    priced: anyPriced && unpricedModels.length === 0,
+    unpriced: unpricedModels.length > 0,
+    unpricedModels: [...new Set(unpricedModels)],
   };
 }
 
