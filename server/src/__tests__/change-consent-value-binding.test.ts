@@ -1,15 +1,3 @@
-// Regression suite for value binding on the change-consent gate.
-//
-// The first `describe` block was written BEFORE the fix and asserted the defect:
-// an accepted request_confirmation card was matched on `payload.target.key`
-// alone, so an approval that displayed one set of values could be redeemed for a
-// completely different set. Those assertions are now INVERTED in place — the
-// same setup, the same exploit attempt, now refused. The git diff of this file
-// is the before/after evidence that the gate now binds an approval to values.
-//
-// What changed in the gate: a card carries a server-stamped digest over the
-// exact end state it authorizes, the caller supplies the digest of the write it
-// is about to perform, and a mismatch denies instead of inheriting the approval.
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
@@ -36,7 +24,6 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-/** The profile fields the consent gate protects, as displayed on a card. */
 type ProfilePatch = {
   name?: string;
   role?: string;
@@ -99,7 +86,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
       runtimeConfig: {},
       permissions: {},
     });
-    // The agent whose profile the approval is about.
     await db.insert(agents).values({
       id: victimId,
       companyId,
@@ -132,10 +118,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     return { companyId, proposerId, victimId, sourceRunId, proposalIssueId };
   }
 
-  /**
-   * Raise and accept a request_confirmation card that DISPLAYS a specific diff.
-   * This mirrors what a proposing agent writes in heartbeat N.
-   */
   async function raiseAcceptedCard(ctx: {
     companyId: string;
     proposerId: string;
@@ -163,9 +145,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
           type: "custom",
           key: agentProfileChangeTargetKey(ctx.victimId),
           revisionId: "proposal-v1",
-          // The card commits to the values it DISPLAYED. In production this
-          // pair is stamped server-side at raise time by
-          // issueThreadInteractionService.create, from target.proposedValues.
           proposedValues: ctx.displayedAfter as Record<string, unknown>,
           valueDigest: consentValueDigest(
             agentProfileChangeTargetKey(ctx.victimId),
@@ -181,12 +160,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     return interactionId;
   }
 
-  /**
-   * The apply step, modelling `assertCanApplyProtectedAgentChange` +
-   * `svc.update(id, patchData)` in server/src/routes/agents.ts (~:2780, ~:5401).
-   * The gate is now handed a digest of the patch it is about to write, so it can
-   * compare the pending write against what the card displayed.
-   */
   async function applyProfilePatch(ctx: {
     companyId: string;
     proposerId: string;
@@ -219,26 +192,15 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     return row;
   }
 
-  // ---------------------------------------------------------------------------
-  // THE FIX (acceptance criterion 3). These are the two tests that asserted the
-  // defect, inverted in place: identical setup, identical exploit attempt, now
-  // refused. Nothing about the attack was made easier to detect — the card is
-  // still accepted, still from a previous run, still unconsumed, still showing a
-  // diff. Only the value binding stops it.
-  // ---------------------------------------------------------------------------
   describe("approvals are bound to the values they displayed", () => {
     it("refuses an approval redeemed for values the human never saw", async () => {
       const ctx = await seedFixture();
 
-      // Heartbeat N: the human is shown, and accepts, a narrow cosmetic change.
       const displayedBefore: ProfilePatch = { title: "Build Engineer" };
       const displayedAfter: ProfilePatch = { title: "Senior Build Engineer" };
       const interactionId = await raiseAcceptedCard({ ...ctx, displayedBefore, displayedAfter });
       const profileBefore = await readProfile(ctx.victimId);
 
-      // Heartbeat N+1: the proposer tries to apply something else entirely
-      // under the same target key. The gate now recomputes the digest from the
-      // pending write and refuses.
       const neverDisplayed: ProfilePatch = {
         name: "Administrator",
         role: "admin",
@@ -256,12 +218,8 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
         details: { code: "consent_value_digest_mismatch" },
       });
 
-      // The undisplayed values were never written.
       expect(await readProfile(ctx.victimId)).toEqual(profileBefore);
 
-      // And the deny path did NOT write: the card is left accepted and
-      // unconsumed, so the audit trail does not claim the human approved
-      // anything, and a correct re-apply can still redeem it.
       const [stored] = await db
         .select({ payload: issueThreadInteractions.payload, result: issueThreadInteractions.result })
         .from(issueThreadInteractions)
@@ -270,12 +228,10 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
       expect((stored?.result as { consumedAt?: unknown }).consumedAt).toBeUndefined();
       expect((stored?.result as { consumedByRunId?: unknown }).consumedByRunId).toBeUndefined();
 
-      // The card still displays only the `title` change, as the human saw it.
       const details = (stored?.payload as { detailsMarkdown: string }).detailsMarkdown;
       expect(details).toContain("+title: Senior Build Engineer");
       expect(details).not.toContain("capabilities:");
 
-      // The approval remains redeemable for exactly what it displayed.
       await expect(applyProfilePatch({
         companyId: ctx.companyId,
         proposerId: ctx.proposerId,
@@ -289,9 +245,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     it("refuses a card whose displayed diff is unrelated boilerplate", async () => {
       const ctx = await seedFixture();
 
-      // `payloadHasDisplayedDiff` is still only a regex over detailsMarkdown —
-      // this card satisfies it. What stops the redemption is that the card is
-      // bound to no values at all, so it authorizes nothing.
       await db.insert(issueThreadInteractions).values({
         id: randomUUID(),
         companyId: ctx.companyId,
@@ -337,14 +290,9 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
       const victimKey = agentProfileChangeTargetKey(ctx.victimId);
       const proposerKey = agentProfileChangeTargetKey(ctx.proposerId);
 
-      // The target key is inside the digest preimage, so the same values under
-      // a different target produce a different digest.
       expect(consentValueDigest(proposerKey, sameValues as Record<string, unknown>))
         .not.toEqual(consentValueDigest(victimKey, sameValues as Record<string, unknown>));
 
-      // A card filed under the VICTIM's target key, but carrying a digest
-      // computed for the proposer's target — the transplant a confused or
-      // malicious proposer would attempt to make one approval cover two targets.
       await db.insert(issueThreadInteractions).values({
         id: randomUUID(),
         companyId: ctx.companyId,
@@ -389,7 +337,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
       const values: ProfilePatch = { title: "Senior Build Engineer" };
       const targetKey = agentProfileChangeTargetKey(ctx.victimId);
 
-      // A future digest algorithm must not be compared with the v1 one.
       await db.insert(issueThreadInteractions).values({
         id: randomUUID(),
         companyId: ctx.companyId,
@@ -432,8 +379,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     it("picks the card bound to this write when several are accepted for one target", async () => {
       const ctx = await seedFixture();
 
-      // Two live approvals under the same target key. The older one is the one
-      // that matches the pending write, so denying on the newest would be wrong.
       const wanted: ProfilePatch = { title: "Senior Build Engineer" };
       const matching = await raiseAcceptedCard({
         ...ctx,
@@ -460,15 +405,11 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
       const consumedIds = rows
         .filter((row) => (row.result as { consumedAt?: unknown }).consumedAt !== undefined)
         .map((row) => row.id);
-      // Exactly the matching card was consumed; the unrelated approval is untouched.
       expect(consumedIds).toEqual([matching]);
       expect(rows.find((row) => row.id === other)?.result).toMatchObject({ outcome: "accepted" });
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // The digest itself.
-  // ---------------------------------------------------------------------------
   describe("consent value digest", () => {
     const targetKey = "agent:11111111-1111-1111-1111-111111111111:profile";
 
@@ -478,7 +419,6 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     });
 
     it("distinguishes a null from an absent field", () => {
-      // `null` means "clear this field" — a real, displayable value.
       expect(consentValueDigest(targetKey, { title: null }))
         .not.toEqual(consentValueDigest(targetKey, {}));
       expect(canonicalizeConsentValues({ title: null })).toEqual('{"title":null}');
@@ -496,16 +436,11 @@ describeEmbeddedPostgres("change consent gate: binding approvals to displayed va
     });
 
     it("refuses values that do not canonicalize predictably", () => {
-      // A Date would serialize to `{}` and silently digest as "no values".
       expect(() => consentValueDigest(targetKey, { when: new Date() })).toThrow();
       expect(() => consentValueDigest(targetKey, { size: Number.NaN })).toThrow();
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Properties the gate DOES enforce today. These must keep passing after the
-  // fix — the fix adds a check, it does not relax any of these.
-  // ---------------------------------------------------------------------------
   describe("existing guarantees that must survive the fix", () => {
     it("still requires a card raised in a previous run", async () => {
       const ctx = await seedFixture();

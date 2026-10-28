@@ -9,6 +9,7 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { AUTHORITY_WIDENING_PERMISSION_KEYS, PERMISSION_KEYS } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -16,6 +17,7 @@ import {
 import {
   AGENT_PROFILE_AUTHORITY_CONSENT_FIELDS,
   CONSENT_VALUE_DIGEST_VERSION,
+  agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
   consentValueDigest,
@@ -25,19 +27,6 @@ import {
 } from "../services/change-consent-gate.js";
 import { resolveInteractionPolicy } from "../services/issue-thread-interactions.js";
 
-/**
- * Authority fields — `role` is the field the authorizer reads to grant company-level
- * authority (`assertSameCompanyCeoAgentOrBoard` tests `actorAgent.role !== "ceo"`
- * and nothing else), yet it is governed in the same consent bucket as `name` and
- * `title`.
- *
- * Board ruling: options 2 + 3. Option 2 is the behaviour under test here — a
- * `role` change may still travel the consent path, but the card is forced
- * `human_only` at raise time and may only be redeemed against an approval a
- * person actually resolved. Option 1 (board-only `role`) was NOT adopted, so a
- * seat holding the direct `agents:configure` grant still bypasses the gate
- * entirely; that is recorded, not fixed, under option 3.
- */
 
 describe("role authority field classification", () => {
   it("classifies role as an authority field and the cosmetic fields as not", () => {
@@ -48,8 +37,6 @@ describe("role authority field classification", () => {
   });
 
   it("treats an explicit null role as a change to the authority field", () => {
-    // `hasOwnProperty`, not truthiness: clearing `role` is still a write to the
-    // field the authorizer reads.
     expect(touchesAgentProfileAuthorityConsentFields({ role: null })).toBe(true);
   });
 
@@ -65,9 +52,14 @@ describe("role authority field classification", () => {
     expect(consentValuesTouchAuthorityField(targetKey, { role: "ceo" })).toBe(true);
     expect(consentValuesTouchAuthorityField(targetKey, { title: "CEO" })).toBe(false);
     expect(consentValuesTouchAuthorityField(targetKey, null)).toBe(false);
-    // An instructions card cannot carry `role`, so it is never an authority card
-    // even if a proposer stuffs the key in.
     expect(consentValuesTouchAuthorityField(`agent:${randomUUID()}:instructions`, { role: "ceo" })).toBe(false);
+  });
+
+  it("records the grant that can reach an authority field as authority widening", () => {
+    expect([...AUTHORITY_WIDENING_PERMISSION_KEYS]).toEqual(["agents:configure"]);
+    for (const key of AUTHORITY_WIDENING_PERMISSION_KEYS) {
+      expect(PERMISSION_KEYS).toContain(key);
+    }
   });
 });
 
@@ -90,8 +82,6 @@ describe("raise-time resolver policy", () => {
 
     expect(policy.effectiveResolverPolicy).toBe("human_only");
     expect(policy.effectiveResolverPolicySource).toBe("governed_action");
-    // The request is preserved verbatim; only the effective policy is escalated,
-    // so the override stays visible rather than being rewritten into history.
     expect(policy.requestedResolverPolicy).toBe("anyone");
   });
 
@@ -128,6 +118,7 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
   });
 
   const PROPOSED_ROLE_CHANGE = { role: "ceo" };
+  const PROPOSED_TITLE_CHANGE = { title: "Senior Build Engineer" };
 
   async function seedFixture() {
     const companyId = randomUUID();
@@ -185,7 +176,6 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
     return { companyId, actorAgentId, peerAgentId, sourceRunId, issueId, targetKey };
   }
 
-  /** An accepted, value-bound, diff-displaying card — valid but for its resolver. */
   async function insertAcceptedCard(ctx: {
     companyId: string;
     issueId: string;
@@ -195,7 +185,9 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
     resolvedByUserId: string | null;
     resolvedByAgentId: string | null;
     effectiveResolverPolicy: "anyone" | "human_only";
+    proposedValues?: Record<string, unknown>;
   }) {
+    const proposedValues = ctx.proposedValues ?? PROPOSED_ROLE_CHANGE;
     const interactionId = randomUUID();
     await db.insert(issueThreadInteractions).values({
       id: interactionId,
@@ -215,8 +207,8 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
           type: "custom",
           key: ctx.targetKey,
           revisionId: "proposal-v1",
-          proposedValues: PROPOSED_ROLE_CHANGE,
-          valueDigest: consentValueDigest(ctx.targetKey, PROPOSED_ROLE_CHANGE),
+          proposedValues,
+          valueDigest: consentValueDigest(ctx.targetKey, proposedValues),
           digestVersion: CONSENT_VALUE_DIGEST_VERSION,
         },
       },
@@ -237,8 +229,6 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
       effectiveResolverPolicy: "anyone",
     });
 
-    // This is the exposure the board ruled on: an agent accepting another
-    // agent's card used to satisfy the gate, because it never read the resolver.
     await expect(changeConsentGateService(db).assertConsented({
       companyId: ctx.companyId,
       actorAgentId: ctx.actorAgentId,
@@ -307,9 +297,6 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
       ...ctx,
       resolvedByUserId: "board-user",
       resolvedByAgentId: null,
-      // Deliberate: the gate tests resolver identity, not the policy label, so a
-      // card a person did resolve before the raise-time escalation existed is
-      // not falsely denied.
       effectiveResolverPolicy: "anyone",
     });
 
@@ -323,23 +310,77 @@ describeEmbeddedPostgres("redeem-time human-resolver requirement", () => {
     })).resolves.toBe(true);
   });
 
-  it("does not disturb a non-authority change resolved by an agent", async () => {
+  it("does not disturb a title-only change resolved by an agent", async () => {
     const ctx = await seedFixture();
     await insertAcceptedCard({
       ...ctx,
       resolvedByUserId: null,
       resolvedByAgentId: ctx.peerAgentId,
       effectiveResolverPolicy: "anyone",
+      proposedValues: PROPOSED_TITLE_CHANGE,
     });
 
-    // Scope check: the new requirement must bind `role` only. A title-only patch
-    // keeps the pre-existing agent-resolvable consent path.
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId: ctx.companyId,
+      actorAgentId: ctx.actorAgentId,
+      actorRunId: randomUUID(),
+      targetKeys: [ctx.targetKey],
+      expectedValueDigest: consentValueDigest(ctx.targetKey, PROPOSED_TITLE_CHANGE),
+      requiresHumanResolver: false,
+    })).resolves.toBe(true);
+  });
+
+  it("refuses a title-only card when the write being made is a role change", async () => {
+    const ctx = await seedFixture();
+    await insertAcceptedCard({
+      ...ctx,
+      resolvedByUserId: "board-user",
+      resolvedByAgentId: null,
+      effectiveResolverPolicy: "human_only",
+      proposedValues: PROPOSED_TITLE_CHANGE,
+    });
+
     await expect(changeConsentGateService(db).assertConsented({
       companyId: ctx.companyId,
       actorAgentId: ctx.actorAgentId,
       actorRunId: randomUUID(),
       targetKeys: [ctx.targetKey],
       expectedValueDigest: consentValueDigest(ctx.targetKey, PROPOSED_ROLE_CHANGE),
+      requiresHumanResolver: true,
+    })).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("redeems an instruction card that carries no value digest", async () => {
+    const ctx = await seedFixture();
+    const instructionsTargetKey = agentInstructionsChangeTargetKey(ctx.actorAgentId);
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId: ctx.companyId,
+      issueId: ctx.issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      effectiveResolverPolicy: "anyone",
+      sourceRunId: ctx.sourceRunId,
+      createdByAgentId: ctx.actorAgentId,
+      payload: {
+        version: 1,
+        prompt: "Apply this instruction change?",
+        detailsMarkdown: "```diff\n-old line\n+new line\n```",
+        target: { type: "custom", key: instructionsTargetKey, revisionId: "proposal-v1" },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedByUserId: "board-user",
+      resolvedByAgentId: null,
+      resolvedAt: new Date(),
+    });
+
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId: ctx.companyId,
+      actorAgentId: ctx.actorAgentId,
+      actorRunId: randomUUID(),
+      targetKeys: [instructionsTargetKey],
+      expectedValueDigest: null,
       requiresHumanResolver: false,
     })).resolves.toBe(true);
   });

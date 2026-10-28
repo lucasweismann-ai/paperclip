@@ -420,12 +420,6 @@ export function resolveInteractionPolicy(args: {
   governance: InteractionResolverGovernance;
   hasToolAction: boolean;
   hasSecretProposal?: boolean;
-  /**
-   * Authority fields: the card commits to an agent-profile field that carries
-   * company-level authority (`role`). Forced `human_only` for the same reason
-   * as a tool action or a secret — accepting it changes what the holder is
-   * allowed to do, so an agent must not be able to accept it for another agent.
-   */
   hasAuthorityFieldProposal?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
@@ -901,18 +895,8 @@ function normalizeCreateInteractionInput(
   }
 }
 
-/** Keep a card's details inside the 20k the payload schema documents. */
 const CONSENT_DETAILS_MARKDOWN_LIMIT = 20_000;
 
-/**
- * Value binding — stamp the server-owned value digest onto a change-consent card.
- *
- * The digest and the human-visible rendering of the authorized values are both
- * derived here from `target.proposedValues`, so the proposer cannot describe one
- * change in its prose and commit the card to another. The digest is stamped in
- * every kill-switch state, so a `warn` window accumulates digests that become
- * enforceable the moment the flag flips.
- */
 function stampConsentValueDigest(
   input: CreateIssueThreadInteraction,
 ): CreateIssueThreadInteraction {
@@ -930,10 +914,6 @@ function stampConsentValueDigest(
   const proposedValues = target.proposedValues ?? null;
   if (!proposedValues) {
     if (isConsentValueDigestTargetKey(target.key)) {
-      // Fail closed at raise time rather than at redeem time: a card for a
-      // change-consent target that commits to nothing can never be redeemed
-      // under `enforce`, so refusing it here saves a human from accepting an
-      // approval that is already void.
       throw unprocessable(
         `A request_confirmation for target '${target.key}' must supply payload.target.proposedValues `
           + "so the approval records exactly which values it authorizes",
@@ -954,9 +934,15 @@ function stampConsentValueDigest(
     values: proposedValues,
     valueDigest,
   });
+  if (authorizedBlock.length + 2 > CONSENT_DETAILS_MARKDOWN_LIMIT) {
+    throw unprocessable(
+      `The rendered authorized-values block is ${authorizedBlock.length} characters, which exceeds the `
+        + `${CONSENT_DETAILS_MARKDOWN_LIMIT}-character limit for payload.detailsMarkdown. `
+        + "Supply a smaller projection in payload.target.proposedValues, such as a content hash "
+        + "instead of the content.",
+    );
+  }
   const proposerDetails = input.payload.detailsMarkdown?.trim() ?? "";
-  // The server block always survives intact; the proposer's prose is what gets
-  // truncated if the two together would overflow.
   const headroom = CONSENT_DETAILS_MARKDOWN_LIMIT - authorizedBlock.length - 2;
   const trimmedProposerDetails = proposerDetails.length > headroom
     ? `${proposerDetails.slice(0, Math.max(headroom - 4, 0))}\n…`
@@ -967,7 +953,7 @@ function stampConsentValueDigest(
     payload: {
       ...input.payload,
       detailsMarkdown: trimmedProposerDetails
-        ? `${trimmedProposerDetails}\n\n${authorizedBlock}`
+        ? `${authorizedBlock}\n\n${trimmedProposerDetails}`
         : authorizedBlock,
       target: {
         ...target,
@@ -3571,9 +3557,6 @@ export function issueThreadInteractionService(
         hasSecretProposal:
           data.kind === "request_confirmation" &&
           data.payload.secretProposal !== undefined,
-        // Authority fields. Read from the server-stamped `proposedValues` that
-        // `stampConsentValueDigest` has already validated above, so the policy
-        // follows the values the card is bound to rather than its prose.
         hasAuthorityFieldProposal:
           data.kind === "request_confirmation" &&
           data.payload.target?.type === "custom" &&

@@ -1026,28 +1026,6 @@ export const PERMISSION_KEYS = [
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 
-/**
- * Grants that can widen the holder's own company-level authority, and must
- * therefore be allocated as privileges rather than conveniences.
- *
- * `agents:configure` is the direct-change grant for `agent_config:update`. An
- * agent-profile PATCH may set `role`, and `role` is the only field
- * `assertSameCompanyCeoAgentOrBoard` reads when deciding who may manage company
- * settings, branding, export and import. A seat holding `agents:configure` can
- * therefore PATCH any seat's `role` — including its own — to `ceo` with no
- * consent card and no human in the loop, because a direct grant short-circuits
- * the change-consent gate before it is ever consulted.
- *
- * The board accepted that behaviour as designed rather than closing it (option
- * 1, board-only `role`, was not adopted) on the condition that it be recorded
- * rather than assumed. This list is that record: granting one of these grants
- * the authority it can reach, not merely the action it names.
- *
- * The consent path is constrained separately — a card proposing `role` is
- * forced `human_only` and may only be redeemed against an approval a person
- * resolved. See AGENT_PROFILE_AUTHORITY_CONSENT_FIELDS in the server's
- * change-consent-gate service.
- */
 export const AUTHORITY_WIDENING_PERMISSION_KEYS = ["agents:configure"] as const;
 export type AuthorityWideningPermissionKey =
   (typeof AUTHORITY_WIDENING_PERMISSION_KEYS)[number];

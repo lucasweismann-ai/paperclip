@@ -20,12 +20,6 @@ import {
   skillChangeTargetKey,
 } from "../services/change-consent-gate.js";
 
-/**
- * Value binding: the gate now binds an approval to the values it displayed, so every
- * card carries a server-stamped digest and every caller supplies the digest of
- * the write it is about to perform. These tests supply both; none of their
- * original assertions changed meaning.
- */
 const PROPOSED_VALUES = { instructions: "Tighten the workflow." };
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -258,14 +252,6 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
     });
   });
 
-  /**
-   * Legacy-key cards predate value binding, so they carry no digest and are
-   * denied under `enforce` — that is the documented migration behaviour, not a
-   * new restriction. What must survive is the legacy key EXPANSION itself: the
-   * gate still finds the card under its old key. The error code proves it: a
-   * digest denial means the card was located and evaluated, where
-   * `reflection_coach_mutation_gate_required` would mean it was never found.
-   */
   async function seedLegacySkillCard(ctx: {
     companyId: string;
     coachId: string;
@@ -307,7 +293,6 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       requiresHumanResolver: false,
     })).rejects.toMatchObject({
       status: 403,
-      // Located under the legacy key, then refused for value binding.
       details: { code: "consent_value_digest_absent" },
     });
   });
@@ -316,9 +301,6 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
     const ctx = await seedGateFixture();
     await seedLegacySkillCard(ctx);
 
-    // `warn` is the documented rollback: it reproduces the pre-value-binding
-    // behaviour exactly, which is what an operator with in-flight legacy
-    // approvals would flip to.
     const previous = process.env.PAPERCLIP_CONSENT_VALUE_DIGEST;
     process.env.PAPERCLIP_CONSENT_VALUE_DIGEST = "warn";
     try {

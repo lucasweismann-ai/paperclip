@@ -1578,10 +1578,6 @@ export const requestConfirmationCustomTargetSchema =
     key: z.string().trim().min(1).max(120),
     revisionId: z.string().trim().min(1).max(255).nullable().optional(),
     revisionNumber: z.number().int().positive().nullable().optional(),
-    // Value binding. `proposedValues` is proposer-supplied; the digest
-    // pair is server-owned and rejected on create (see the route and
-    // issueThreadInteractionService.create), so it is accepted here only so
-    // that stored payloads re-validate.
     proposedValues: z.record(z.string(), z.unknown()).nullable().optional(),
     valueDigest: z.string().trim().length(64).nullable().optional(),
     digestVersion: z.number().int().positive().nullable().optional(),

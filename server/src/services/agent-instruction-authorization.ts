@@ -188,14 +188,7 @@ export async function authorizeInstructionCommit(
       actorAgentId: bound.agentId,
       actorRunId: bound.runId,
       targetKeys: [agentInstructionsChangeTargetKey(target.id)],
-      // This shared writer receives only the target, not the content being
-      // written, so it cannot compute a value digest. `null` means "not value
-      // bound", which is exactly this path's behaviour before value binding —
-      // so this is not a regression, but it is also not yet covered by the
-      // value-binding guarantee. Threading the pending content through every
-      // instruction writer is follow-up work, flagged rather than done here.
       expectedValueDigest: null,
-      // Instructions carry no authority field; `role` lives only on the profile.
       requiresHumanResolver: false,
     });
     decision = await access.decide({

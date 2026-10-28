@@ -2510,18 +2510,7 @@ export function agentRoutes(
     req: Request,
     targetAgent: { id: string; companyId: string },
     targetKeys: string[],
-    /**
-     * Value binding: digest over the exact values this route is about to write, or
-     * `null` for a route an agent actor cannot reach (where there is nothing to
-     * bind). Required at every call site so a new one cannot silently inherit
-     * the unbound behaviour.
-     */
     expectedValueDigest: string | null,
-    /**
-     * Authority fields: true when the write sets a profile field that carries
-     * company-level authority, which may only be consented to by a person.
-     * Required at every call site for the same reason as the digest.
-     */
     requiresHumanResolver: boolean,
   ) {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
@@ -2574,7 +2563,6 @@ export function agentRoutes(
   async function assertCanManageInstructionsPath(
     req: Request,
     targetAgent: { id: string; companyId: string },
-    /** The values about to be written, or `null` on agent-unreachable routes. */
     proposedValues: Record<string, unknown> | null,
   ) {
     const targetKey = agentInstructionsChangeTargetKey(targetAgent.id);
@@ -2583,7 +2571,6 @@ export function agentRoutes(
       targetAgent,
       [targetKey],
       proposedValues ? consentValueDigest(targetKey, proposedValues) : null,
-      // Instructions carry no authority field; `role` lives only on the profile.
       false,
     );
   }
@@ -2594,8 +2581,6 @@ export function agentRoutes(
     patchData: Record<string, unknown>,
   ) {
     const targetKey = agentProfileChangeTargetKey(targetAgent.id);
-    // Digest only the consent-protected profile fields actually present in the
-    // patch — the exact values handed to svc.update.
     const proposedValues: Record<string, unknown> = {};
     for (const field of AGENT_PROFILE_CHANGE_CONSENT_FIELDS) {
       if (Object.prototype.hasOwnProperty.call(patchData, field)) {
@@ -2607,8 +2592,6 @@ export function agentRoutes(
       targetAgent,
       [targetKey],
       consentValueDigest(targetKey, proposedValues),
-      // Authority fields: computed from the projection actually being written, so a
-      // patch that only retitles a seat keeps the ordinary consent path.
       touchesAgentProfileAuthorityConsentFields(proposedValues),
     );
   }
@@ -5032,10 +5015,6 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
-    // Board-only route (the actor check above rejects every other actor type),
-    // so no agent actor can ever reach the consent branch and there is nothing
-    // to bind. Under `enforce` a null digest denies, which is the fail-closed
-    // outcome if that actor check were ever loosened.
     await assertCanManageInstructionsPath(req, existing, null);
     assertExternalInstructionsAdmin(req, existing);
 
@@ -5138,7 +5117,6 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    // The validated body IS the bundle change being applied.
     await assertCanManageInstructionsPath(req, existing, { ...(req.body as Record<string, unknown>) });
     assertExternalInstructionsAdmin(req, existing);
     if (req.body.mode === "external") assertInstanceAdmin(req);
@@ -5223,10 +5201,6 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    // Value binding: the digest covers the content HASH, not the content, so the
-    // preimage stays bounded and no instruction text passes through the card or
-    // the audit log. Built once here and reused at every gate call on this
-    // route, so each path authorizes the same end state.
     const instructionsProposedValues = {
       op: "upsert" as const,
       path: req.body.path,
@@ -5374,23 +5348,12 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    // The path is read and validated before the gate so the digest can cover
-    // which file is being deleted. A malformed request is still rejected as
-    // malformed; the 422 discloses nothing about consent.
     const relativePath = typeof req.query.path === "string" ? req.query.path : "";
     if (!relativePath.trim()) {
       res.status(422).json({ error: "Query parameter 'path' is required" });
       return;
     }
 
-    // The value-binding gate runs BEFORE the managed-bundle branch, not after it.
-    // Merge decision: upstream's managed path returns early and
-    // `agentFileStore.write` authorizes only path safety and size limits, so
-    // gating after the branch would leave managed deletes able to reach the
-    // same end state through a different route — the exact bypass shape this
-    // work exists to close. Failing closed for both paths is the conservative
-    // reading of the value-binding intent; it does add a consent requirement to managed
-    // deletes, which is called out for review.
     await assertCanManageInstructionsPath(req, existing, { op: "delete", path: relativePath });
     assertExternalInstructionsAdmin(req, existing);
 
@@ -5504,10 +5467,6 @@ export function agentRoutes(
       assertNoAgentAdapterConfigMutation(req, adapterConfig);
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
-        // Unreachable for an agent actor: this branch fires only when a known
-        // instructions-bundle key is PRESENT in the requested config, which is
-        // exactly what assertNoAgentAdapterConfigMutation above 403s on. Null
-        // digest, so it fails closed if that boundary ever moves.
         await assertCanManageInstructionsPath(req, existing, null);
       }
       patchData.adapterConfig = adapterConfig;
@@ -5567,11 +5526,6 @@ export function agentRoutes(
       const requestedAdapterConfig = hasOwn(patchData, "adapterConfig")
         ? (asRecord(patchData.adapterConfig) ?? {})
         : null;
-      // Reachable for an agent actor, unlike the branch above:
-      // assertNoAgentAdapterConfigMutation only inspects keys PRESENT in the
-      // requested config, and this branch fires precisely when a bundle key is
-      // OMITTED under replaceAdapterConfig — i.e. about to be cleared. So it
-      // gets a real projection: the set of keys this write would drop.
       const clearedInstructionsBundleKeys = requestedAdapterConfig && replaceAdapterConfig
         ? KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) =>
           existingAdapterConfig[key] !== undefined && requestedAdapterConfig[key] === undefined,

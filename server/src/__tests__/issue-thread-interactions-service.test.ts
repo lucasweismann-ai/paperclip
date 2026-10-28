@@ -4683,15 +4683,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // The raise-time half of value binding.
-  //
-  // The consent gate refuses a write whose digest does not match the card's.
-  // That is only worth anything if the digest and the values the human SEES are
-  // both produced by the server from the same field: otherwise a proposer could
-  // stamp the digest of what it intends to write while describing something
-  // harmless, and the original defect would survive the fix unchanged.
-  // ---------------------------------------------------------------------------
   describe("change-consent value digest stamping", () => {
     async function seedProposer(companyId: string) {
       const agentId = randomUUID();
@@ -4721,7 +4712,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         payload: {
           version: 1,
           prompt: "Apply this profile change?",
-          // Deliberately misleading prose: it claims nothing is changing.
           detailsMarkdown: "Routine cleanup, no material change.",
           target: {
             type: "custom",
@@ -4736,24 +4726,60 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         target?: { valueDigest?: string; digestVersion?: number; proposedValues?: unknown };
       };
 
-      // The digest is the one the gate will recompute from the pending write.
       expect(payload.target?.valueDigest).toBe(consentValueDigest(targetKey, proposedValues));
       expect(payload.target?.digestVersion).toBe(CONSENT_VALUE_DIGEST_VERSION);
 
-      // The proposer's prose is kept, but the server's own rendering of the
-      // authorized end state is appended to it — so the human cannot be shown
-      // "no material change" for a card that authorizes a title change.
       expect(payload.detailsMarkdown).toContain("Routine cleanup, no material change.");
       expect(payload.detailsMarkdown).toContain(CONSENT_VALUES_MARKDOWN_HEADING);
       expect(payload.detailsMarkdown).toContain("Senior Build Engineer");
       expect(payload.detailsMarkdown).toContain(payload.target!.valueDigest!);
+      expect(payload.detailsMarkdown!.startsWith(CONSENT_VALUES_MARKDOWN_HEADING)).toBe(true);
     });
 
-    // A card that commits to `role` is the authority-widening case and must be
-    // escalated to `human_only` at raise time, so an agent cannot accept it on
-    // another agent's behalf. These assert the wiring from the server-stamped
-    // `proposedValues` through to the stored policy; the gate's redeem-time half
-    // lives in role-authority-consent.test.ts.
+    it("keeps the authorized values ahead of prose that opens an unterminated HTML comment", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Comment injection");
+      const proposerId = await seedProposer(companyId);
+      const targetKey = `agent:${randomUUID()}:profile`;
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          detailsMarkdown: "Routine cleanup.\n\n<!-- ```diff",
+          target: { type: "custom", key: targetKey, proposedValues: { role: "ceo" } },
+        },
+      }, { agentId: proposerId });
+
+      const payload = created.payload as { detailsMarkdown?: string };
+      const details = payload.detailsMarkdown!;
+      expect(details.startsWith(CONSENT_VALUES_MARKDOWN_HEADING)).toBe(true);
+      expect(details.indexOf(CONSENT_VALUES_MARKDOWN_HEADING)).toBeLessThan(details.indexOf("<!--"));
+      expect(details).toContain("\"role\": \"ceo\"");
+    });
+
+    it("refuses proposedValues whose rendered block would overflow detailsMarkdown", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Oversized block");
+      const proposerId = await seedProposer(companyId);
+      const targetKey = `agent:${randomUUID()}:profile`;
+
+      await expect(interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          detailsMarkdown: "Bulk update.",
+          target: {
+            type: "custom",
+            key: targetKey,
+            proposedValues: { items: Array.from({ length: 3_900 }, () => 0) },
+          },
+        },
+      }, { agentId: proposerId })).rejects.toMatchObject({ status: 422 });
+    });
+
     it("forces human_only for a card proposing a role change", async () => {
       const { companyId, issueId } = await seedConfirmationIssue("Role escalation");
       const proposerId = await seedProposer(companyId);
@@ -4762,8 +4788,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       const created = await interactionsSvc.create({ id: issueId, companyId }, {
         kind: "request_confirmation",
         continuationPolicy: "wake_assignee_on_accept",
-        // Asking for the weakest audience must not get it: `role` is the field
-        // the authorizer reads to grant company-level authority.
         resolverPolicy: "anyone",
         payload: {
           version: 1,
@@ -4813,8 +4837,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       const subjectId = randomUUID();
       const targetKey = `agent:${subjectId}:profile`;
 
-      // Stamping the digest of the values it intends to write while displaying
-      // something else is exactly the bypass this check closes.
       await expect(interactionsSvc.create({ id: issueId, companyId }, {
         kind: "request_confirmation",
         continuationPolicy: "wake_assignee_on_accept",
@@ -4841,9 +4863,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       const proposerId = await seedProposer(companyId);
       const subjectId = randomUUID();
 
-      // Fails closed at raise time rather than at redeem time: such a card can
-      // never be redeemed under `enforce`, so a human must not be asked to
-      // accept an approval that is already void.
       await expect(interactionsSvc.create({ id: issueId, companyId }, {
         kind: "request_confirmation",
         continuationPolicy: "wake_assignee_on_accept",

@@ -2652,12 +2652,6 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     }
 
     if (input.action === "agent_config:update") {
-      // Authority fields: `agents:configure` is authority-widening, not cosmetic — an
-      // agent-profile PATCH may set `role`, and `role` alone decides who may
-      // manage company settings. The `direct` grant returns allowed here and so
-      // never reaches the change-consent gate; that is accepted by board ruling
-      // (option 3) and recorded in AUTHORITY_WIDENING_PERMISSION_KEYS. Do not
-      // add this grant to a role or default without reading that note.
       return decideWithProtectedChangeGrants("agent", actorAgentId, {
         direct: "agents:configure",
         suggest: "agents:suggest-changes",
