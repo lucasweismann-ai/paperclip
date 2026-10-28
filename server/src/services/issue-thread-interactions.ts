@@ -112,6 +112,13 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import {
+  CONSENT_VALUE_DIGEST_VERSION,
+  consentValueDigest,
+  consentValuesTouchAuthorityField,
+  isConsentValueDigestTargetKey,
+  renderConsentValuesMarkdown,
+} from "./change-consent-gate.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -413,6 +420,13 @@ export function resolveInteractionPolicy(args: {
   governance: InteractionResolverGovernance;
   hasToolAction: boolean;
   hasSecretProposal?: boolean;
+  /**
+   * Authority fields: the card commits to an agent-profile field that carries
+   * company-level authority (`role`). Forced `human_only` for the same reason
+   * as a tool action or a secret — accepting it changes what the holder is
+   * allowed to do, so an agent must not be able to accept it for another agent.
+   */
+  hasAuthorityFieldProposal?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
   const requestedPolicyInput =
@@ -427,7 +441,7 @@ export function resolveInteractionPolicy(args: {
   let effectiveResolverPolicy = requestedResolverPolicy;
   let effectiveResolverPolicySource: IssueThreadInteractionEffectiveResolverPolicySource =
     "requested";
-  if (args.hasToolAction || args.hasSecretProposal) {
+  if (args.hasToolAction || args.hasSecretProposal || args.hasAuthorityFieldProposal) {
     effectiveResolverPolicy = "human_only";
     effectiveResolverPolicySource = "governed_action";
   } else if (kindGovernance?.cap) {
@@ -885,6 +899,84 @@ function normalizeCreateInteractionInput(
     default:
       return input;
   }
+}
+
+/** Keep a card's details inside the 20k the payload schema documents. */
+const CONSENT_DETAILS_MARKDOWN_LIMIT = 20_000;
+
+/**
+ * Value binding — stamp the server-owned value digest onto a change-consent card.
+ *
+ * The digest and the human-visible rendering of the authorized values are both
+ * derived here from `target.proposedValues`, so the proposer cannot describe one
+ * change in its prose and commit the card to another. The digest is stamped in
+ * every kill-switch state, so a `warn` window accumulates digests that become
+ * enforceable the moment the flag flips.
+ */
+function stampConsentValueDigest(
+  input: CreateIssueThreadInteraction,
+): CreateIssueThreadInteraction {
+  if (input.kind !== "request_confirmation") return input;
+  const target = input.payload.target;
+  if (!target || target.type !== "custom") return input;
+
+  if (target.valueDigest !== undefined || target.digestVersion !== undefined) {
+    throw unprocessable(
+      "payload.target.valueDigest and payload.target.digestVersion are server-owned metadata "
+        + "and cannot be supplied when creating an interaction",
+    );
+  }
+
+  const proposedValues = target.proposedValues ?? null;
+  if (!proposedValues) {
+    if (isConsentValueDigestTargetKey(target.key)) {
+      // Fail closed at raise time rather than at redeem time: a card for a
+      // change-consent target that commits to nothing can never be redeemed
+      // under `enforce`, so refusing it here saves a human from accepting an
+      // approval that is already void.
+      throw unprocessable(
+        `A request_confirmation for target '${target.key}' must supply payload.target.proposedValues `
+          + "so the approval records exactly which values it authorizes",
+      );
+    }
+    return input;
+  }
+
+  if (!isConsentValueDigestTargetKey(target.key)) {
+    throw unprocessable(
+      `payload.target.proposedValues is only meaningful for change-consent targets, not '${target.key}'`,
+    );
+  }
+
+  const valueDigest = consentValueDigest(target.key, proposedValues);
+  const authorizedBlock = renderConsentValuesMarkdown({
+    targetKey: target.key,
+    values: proposedValues,
+    valueDigest,
+  });
+  const proposerDetails = input.payload.detailsMarkdown?.trim() ?? "";
+  // The server block always survives intact; the proposer's prose is what gets
+  // truncated if the two together would overflow.
+  const headroom = CONSENT_DETAILS_MARKDOWN_LIMIT - authorizedBlock.length - 2;
+  const trimmedProposerDetails = proposerDetails.length > headroom
+    ? `${proposerDetails.slice(0, Math.max(headroom - 4, 0))}\n…`
+    : proposerDetails;
+
+  return {
+    ...input,
+    payload: {
+      ...input.payload,
+      detailsMarkdown: trimmedProposerDetails
+        ? `${trimmedProposerDetails}\n\n${authorizedBlock}`
+        : authorizedBlock,
+      target: {
+        ...target,
+        proposedValues,
+        valueDigest,
+        digestVersion: CONSENT_VALUE_DIGEST_VERSION,
+      },
+    },
+  };
 }
 
 function buildSupersededByCommentResult(
@@ -3435,8 +3527,10 @@ export function issueThreadInteractionService(
       actor: InteractionActor,
       options: CreateInteractionOptions = {},
     ) => {
-      const data = normalizeCreateInteractionInput(
-        createIssueThreadInteractionSchema.parse(input),
+      const data = stampConsentValueDigest(
+        normalizeCreateInteractionInput(
+          createIssueThreadInteractionSchema.parse(input),
+        ),
       );
       // Chat ownership is server-owned and immutable. Ordinary human questions
       // must not depend on a model copying an opaque user identity correctly.
@@ -3477,6 +3571,16 @@ export function issueThreadInteractionService(
         hasSecretProposal:
           data.kind === "request_confirmation" &&
           data.payload.secretProposal !== undefined,
+        // Authority fields. Read from the server-stamped `proposedValues` that
+        // `stampConsentValueDigest` has already validated above, so the policy
+        // follows the values the card is bound to rather than its prose.
+        hasAuthorityFieldProposal:
+          data.kind === "request_confirmation" &&
+          data.payload.target?.type === "custom" &&
+          consentValuesTouchAuthorityField(
+            data.payload.target.key,
+            data.payload.target.proposedValues ?? null,
+          ),
       });
       const normalizedData = {
         ...data,

@@ -485,6 +485,11 @@ const DEFINITIONS_BY_KEY = new Map(DEFINITIONS.map((definition) => [definition.k
 // seeded. Add a definition key here to restore automatic provisioning.
 const AUTO_PROVISION_ON_COMPANY_CREATE_KEYS = new Set<string>([]);
 
+// Authority fields: `agents:configure` here is authority-widening, not merely a
+// convenience for editing peers — it lets the holder PATCH any seat's `role`,
+// the field that alone decides who may manage company settings. Deliberate for
+// the root agent; read AUTHORITY_WIDENING_PERMISSION_KEYS before copying this
+// default onto any other seat.
 const ROOT_AGENT_DEFAULT_CHANGE_GRANTS: PermissionKey[] = ["agents:configure", "skills:create"];
 const BUILT_IN_AGENT_DEFAULT_GRANTS: Record<string, PermissionKey[]> = {
   "reflection-coach": ["agents:suggest-changes", "skills:suggest-changes"],

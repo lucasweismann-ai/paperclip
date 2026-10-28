@@ -51,7 +51,7 @@ import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js"
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -288,6 +288,8 @@ import {
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
+  consentValueDigest,
+  touchesAgentProfileAuthorityConsentFields,
   touchesAgentProfileChangeConsentFields,
 } from "../services/change-consent-gate.js";
 import {
@@ -2508,6 +2510,19 @@ export function agentRoutes(
     req: Request,
     targetAgent: { id: string; companyId: string },
     targetKeys: string[],
+    /**
+     * Value binding: digest over the exact values this route is about to write, or
+     * `null` for a route an agent actor cannot reach (where there is nothing to
+     * bind). Required at every call site so a new one cannot silently inherit
+     * the unbound behaviour.
+     */
+    expectedValueDigest: string | null,
+    /**
+     * Authority fields: true when the write sets a profile field that carries
+     * company-level authority, which may only be consented to by a person.
+     * Required at every call site for the same reason as the digest.
+     */
+    requiresHumanResolver: boolean,
   ) {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
@@ -2531,6 +2546,8 @@ export function agentRoutes(
           actorAgentId: req.actor.agentId,
           actorRunId: req.actor.runId ?? null,
           targetKeys,
+          expectedValueDigest,
+          requiresHumanResolver,
         });
       } catch (err) {
         if (err instanceof HttpError && err.status === 403) {
@@ -2554,22 +2571,45 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
+  async function assertCanManageInstructionsPath(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    /** The values about to be written, or `null` on agent-unreachable routes. */
+    proposedValues: Record<string, unknown> | null,
+  ) {
+    const targetKey = agentInstructionsChangeTargetKey(targetAgent.id);
     await assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
-      [agentInstructionsChangeTargetKey(targetAgent.id)],
+      [targetKey],
+      proposedValues ? consentValueDigest(targetKey, proposedValues) : null,
+      // Instructions carry no authority field; `role` lives only on the profile.
+      false,
     );
   }
 
   async function assertCanApplyAgentProfileChange(
     req: Request,
     targetAgent: { id: string; companyId: string },
+    patchData: Record<string, unknown>,
   ) {
+    const targetKey = agentProfileChangeTargetKey(targetAgent.id);
+    // Digest only the consent-protected profile fields actually present in the
+    // patch — the exact values handed to svc.update.
+    const proposedValues: Record<string, unknown> = {};
+    for (const field of AGENT_PROFILE_CHANGE_CONSENT_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(patchData, field)) {
+        proposedValues[field] = patchData[field];
+      }
+    }
     await assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
-      [agentProfileChangeTargetKey(targetAgent.id)],
+      [targetKey],
+      consentValueDigest(targetKey, proposedValues),
+      // Authority fields: computed from the projection actually being written, so a
+      // patch that only retitles a seat keeps the ordinary consent path.
+      touchesAgentProfileAuthorityConsentFields(proposedValues),
     );
   }
 
@@ -4992,7 +5032,11 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
-    await assertCanManageInstructionsPath(req, existing);
+    // Board-only route (the actor check above rejects every other actor type),
+    // so no agent actor can ever reach the consent branch and there is nothing
+    // to bind. Under `enforce` a null digest denies, which is the fail-closed
+    // outcome if that actor check were ever loosened.
+    await assertCanManageInstructionsPath(req, existing, null);
     assertExternalInstructionsAdmin(req, existing);
 
     const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
@@ -5094,7 +5138,8 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing);
+    // The validated body IS the bundle change being applied.
+    await assertCanManageInstructionsPath(req, existing, { ...(req.body as Record<string, unknown>) });
     assertExternalInstructionsAdmin(req, existing);
     if (req.body.mode === "external") assertInstanceAdmin(req);
 
@@ -5178,13 +5223,23 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    // Value binding: the digest covers the content HASH, not the content, so the
+    // preimage stays bounded and no instruction text passes through the card or
+    // the audit log. Built once here and reused at every gate call on this
+    // route, so each path authorizes the same end state.
+    const instructionsProposedValues = {
+      op: "upsert" as const,
+      path: req.body.path,
+      contentSha256: createHash("sha256").update(req.body.content ?? "", "utf8").digest("hex"),
+      clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate === true,
+    };
     const entryFile = deriveBundleState(existing).entryFile;
     if (instructionPath(req.body.path) === entryFile) {
       assertExternalInstructionsAdmin(req, existing);
       if (req.body.baseHash !== undefined) req.body.baseRevisionId = req.body.baseHash === null ? null : agentFileTokenFromHash(req.body.baseHash);
       if (req.body.baseRevisionId === undefined) throw unprocessable("Read the entry and supply baseRevisionId (null for a new entry)", { code: "INSTRUCTION_BASE_REQUIRED" });
       // Clearing legacy prompt configuration remains a protected config change.
-      if (req.body.clearLegacyPromptTemplate) await assertCanManageInstructionsPath(req, existing);
+      if (req.body.clearLegacyPromptTemplate) await assertCanManageInstructionsPath(req, existing, instructionsProposedValues);
       const receipt = await instructionRevisions.commit({ companyId: existing.companyId, agentId: existing.id,
         entryFile, content: req.body.content, baseRevisionId: req.body.baseRevisionId,
         source: req.actor.type === "board" ? "board" : "api" }, req.actor);
@@ -5205,7 +5260,7 @@ export function agentRoutes(
       res.json(instructionFileDetail(receipt, receipt));
       return;
     }
-    await assertCanManageInstructionsPath(req, existing);
+    await assertCanManageInstructionsPath(req, existing, instructionsProposedValues);
     assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
@@ -5319,14 +5374,25 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing);
-    assertExternalInstructionsAdmin(req, existing);
-
+    // The path is read and validated before the gate so the digest can cover
+    // which file is being deleted. A malformed request is still rejected as
+    // malformed; the 422 discloses nothing about consent.
     const relativePath = typeof req.query.path === "string" ? req.query.path : "";
     if (!relativePath.trim()) {
       res.status(422).json({ error: "Query parameter 'path' is required" });
       return;
     }
+
+    // The value-binding gate runs BEFORE the managed-bundle branch, not after it.
+    // Merge decision: upstream's managed path returns early and
+    // `agentFileStore.write` authorizes only path safety and size limits, so
+    // gating after the branch would leave managed deletes able to reach the
+    // same end state through a different route — the exact bypass shape this
+    // work exists to close. Failing closed for both paths is the conservative
+    // reading of the value-binding intent; it does add a consent requirement to managed
+    // deletes, which is called out for review.
+    await assertCanManageInstructionsPath(req, existing, { op: "delete", path: relativePath });
+    assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed") {
       const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
@@ -5334,6 +5400,7 @@ export function agentRoutes(
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor);
       res.json(await instructions.getBundle(existing)); return;
     }
+
     const actor = getActorInfo(req);
     const result = await instructions.deleteFile(existing, relativePath);
     await logActivity(db, {
@@ -5437,7 +5504,11 @@ export function agentRoutes(
       assertNoAgentAdapterConfigMutation(req, adapterConfig);
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
-        await assertCanManageInstructionsPath(req, existing);
+        // Unreachable for an agent actor: this branch fires only when a known
+        // instructions-bundle key is PRESENT in the requested config, which is
+        // exactly what assertNoAgentAdapterConfigMutation above 403s on. Null
+        // digest, so it fails closed if that boundary ever moves.
+        await assertCanManageInstructionsPath(req, existing, null);
       }
       patchData.adapterConfig = adapterConfig;
     }
@@ -5496,14 +5567,21 @@ export function agentRoutes(
       const requestedAdapterConfig = hasOwn(patchData, "adapterConfig")
         ? (asRecord(patchData.adapterConfig) ?? {})
         : null;
-      if (
-        requestedAdapterConfig
-        && replaceAdapterConfig
-        && KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) =>
+      // Reachable for an agent actor, unlike the branch above:
+      // assertNoAgentAdapterConfigMutation only inspects keys PRESENT in the
+      // requested config, and this branch fires precisely when a bundle key is
+      // OMITTED under replaceAdapterConfig — i.e. about to be cleared. So it
+      // gets a real projection: the set of keys this write would drop.
+      const clearedInstructionsBundleKeys = requestedAdapterConfig && replaceAdapterConfig
+        ? KNOWN_INSTRUCTIONS_BUNDLE_KEYS.filter((key) =>
           existingAdapterConfig[key] !== undefined && requestedAdapterConfig[key] === undefined,
         )
-      ) {
-        await assertCanManageInstructionsPath(req, existing);
+        : [];
+      if (clearedInstructionsBundleKeys.length > 0) {
+        await assertCanManageInstructionsPath(req, existing, {
+          op: "clear-instructions-config",
+          clearedKeys: [...clearedInstructionsBundleKeys].sort(),
+        });
       }
       let rawEffectiveAdapterConfig = requestedAdapterConfig
         ? restoreRedactedAgentEnv(requestedAdapterConfig, existingAdapterConfig)
@@ -5663,7 +5741,7 @@ export function agentRoutes(
       (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
     );
     if (profileOnlyChange) {
-      await assertCanApplyAgentProfileChange(req, existing);
+      await assertCanApplyAgentProfileChange(req, existing, patchData);
     } else {
       await assertCanConfigureAgentSetup(req, existing);
     }

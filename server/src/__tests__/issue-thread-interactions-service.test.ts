@@ -38,6 +38,11 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
+import {
+  CONSENT_VALUES_MARKDOWN_HEADING,
+  CONSENT_VALUE_DIGEST_VERSION,
+  consentValueDigest,
+} from "../services/change-consent-gate.js";
 
 const externalUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_INTERACTIONS_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -4675,6 +4680,210 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         id: created.id,
         status: "accepted",
       });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // The raise-time half of value binding.
+  //
+  // The consent gate refuses a write whose digest does not match the card's.
+  // That is only worth anything if the digest and the values the human SEES are
+  // both produced by the server from the same field: otherwise a proposer could
+  // stamp the digest of what it intends to write while describing something
+  // harmless, and the original defect would survive the fix unchanged.
+  // ---------------------------------------------------------------------------
+  describe("change-consent value digest stamping", () => {
+    async function seedProposer(companyId: string) {
+      const agentId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Proposer",
+        role: "general",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      return agentId;
+    }
+
+    it("stamps the digest server-side and displays the values it commits to", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Digest stamping");
+      const proposerId = await seedProposer(companyId);
+      const subjectId = randomUUID();
+      const targetKey = `agent:${subjectId}:profile`;
+      const proposedValues = { title: "Senior Build Engineer" };
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          // Deliberately misleading prose: it claims nothing is changing.
+          detailsMarkdown: "Routine cleanup, no material change.",
+          target: {
+            type: "custom",
+            key: targetKey,
+            proposedValues,
+          },
+        },
+      }, { agentId: proposerId });
+
+      const payload = created.payload as {
+        detailsMarkdown?: string;
+        target?: { valueDigest?: string; digestVersion?: number; proposedValues?: unknown };
+      };
+
+      // The digest is the one the gate will recompute from the pending write.
+      expect(payload.target?.valueDigest).toBe(consentValueDigest(targetKey, proposedValues));
+      expect(payload.target?.digestVersion).toBe(CONSENT_VALUE_DIGEST_VERSION);
+
+      // The proposer's prose is kept, but the server's own rendering of the
+      // authorized end state is appended to it — so the human cannot be shown
+      // "no material change" for a card that authorizes a title change.
+      expect(payload.detailsMarkdown).toContain("Routine cleanup, no material change.");
+      expect(payload.detailsMarkdown).toContain(CONSENT_VALUES_MARKDOWN_HEADING);
+      expect(payload.detailsMarkdown).toContain("Senior Build Engineer");
+      expect(payload.detailsMarkdown).toContain(payload.target!.valueDigest!);
+    });
+
+    // A card that commits to `role` is the authority-widening case and must be
+    // escalated to `human_only` at raise time, so an agent cannot accept it on
+    // another agent's behalf. These assert the wiring from the server-stamped
+    // `proposedValues` through to the stored policy; the gate's redeem-time half
+    // lives in role-authority-consent.test.ts.
+    it("forces human_only for a card proposing a role change", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Role escalation");
+      const proposerId = await seedProposer(companyId);
+      const targetKey = `agent:${randomUUID()}:profile`;
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        // Asking for the weakest audience must not get it: `role` is the field
+        // the authorizer reads to grant company-level authority.
+        resolverPolicy: "anyone",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          detailsMarkdown: "Routine cleanup.",
+          target: { type: "custom", key: targetKey, proposedValues: { role: "ceo" } },
+        },
+      }, { agentId: proposerId });
+
+      expect(created).toMatchObject({
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "human_only",
+        effectiveResolverPolicySource: "governed_action",
+      });
+    });
+
+    it("leaves a title-only profile card on the ordinary consent audience", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Title change");
+      const proposerId = await seedProposer(companyId);
+      const targetKey = `agent:${randomUUID()}:profile`;
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        resolverPolicy: "anyone",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          detailsMarkdown: "Retitle only.",
+          target: {
+            type: "custom",
+            key: targetKey,
+            proposedValues: { title: "Senior Build Engineer" },
+          },
+        },
+      }, { agentId: proposerId });
+
+      expect(created).toMatchObject({
+        effectiveResolverPolicy: "anyone",
+        effectiveResolverPolicySource: "requested",
+      });
+    });
+
+    it("refuses a proposer-supplied digest", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Digest forgery");
+      const proposerId = await seedProposer(companyId);
+      const subjectId = randomUUID();
+      const targetKey = `agent:${subjectId}:profile`;
+
+      // Stamping the digest of the values it intends to write while displaying
+      // something else is exactly the bypass this check closes.
+      await expect(interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          detailsMarkdown: "```diff\n-title: Build Engineer\n+title: Senior Build Engineer\n```",
+          target: {
+            type: "custom",
+            key: targetKey,
+            proposedValues: { title: "Senior Build Engineer" },
+            valueDigest: consentValueDigest(targetKey, { role: "admin" }),
+            digestVersion: CONSENT_VALUE_DIGEST_VERSION,
+          },
+        },
+      }, { agentId: proposerId })).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining("server-owned"),
+      });
+    });
+
+    it("refuses a change-consent card that commits to no values", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Digest absent");
+      const proposerId = await seedProposer(companyId);
+      const subjectId = randomUUID();
+
+      // Fails closed at raise time rather than at redeem time: such a card can
+      // never be redeemed under `enforce`, so a human must not be asked to
+      // accept an approval that is already void.
+      await expect(interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: "Apply this profile change?",
+          detailsMarkdown: "```diff\n+title: Senior Build Engineer\n```",
+          target: {
+            type: "custom",
+            key: `agent:${subjectId}:profile`,
+          },
+        },
+      }, { agentId: proposerId })).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining("proposedValues"),
+      });
+    });
+
+    it("leaves non-consent confirmation cards untouched", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Unrelated card");
+      const proposerId = await seedProposer(companyId);
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: "Ship the release?",
+          detailsMarkdown: "Cut 0.3.2 from master.",
+          target: { type: "custom", key: "release:0.3.2" },
+        },
+      }, { agentId: proposerId });
+
+      const payload = created.payload as {
+        detailsMarkdown?: string;
+        target?: { valueDigest?: string; digestVersion?: number };
+      };
+      expect(payload.target?.valueDigest).toBeUndefined();
+      expect(payload.target?.digestVersion).toBeUndefined();
+      expect(payload.detailsMarkdown).toBe("Cut 0.3.2 from master.");
     });
   });
 });

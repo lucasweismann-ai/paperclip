@@ -1363,6 +1363,23 @@ export interface RequestConfirmationCustomTarget {
   revisionNumber?: number | null;
   label?: string | null;
   href?: string | null;
+  /**
+   * Value binding: the exact end state this card asks the human to authorize, for
+   * change-consent target keys. Supplied by the proposer, but the card's
+   * human-visible rendering of these values is generated server-side from this
+   * field — so the values displayed and the values committed cannot diverge.
+   */
+  proposedValues?: Record<string, unknown> | null;
+  /**
+   * Server-owned digest over `proposedValues` (see `consentValueDigest`).
+   * Rejected if supplied when creating an interaction, exactly like
+   * `toolAction` and `secretProposal`. At redeem time the consent gate
+   * recomputes the digest from the pending write and refuses the card unless
+   * it matches, so an approval cannot be reused for undisplayed values.
+   */
+  valueDigest?: string | null;
+  /** Server-owned. An unrecognized version fails closed at redeem time. */
+  digestVersion?: number | null;
 }
 
 export type RequestConfirmationTarget =
