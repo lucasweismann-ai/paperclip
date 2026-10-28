@@ -12,7 +12,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { parseFrontmatterMarkdown } from "@paperclipai/shared";
+import { parseFrontmatterMarkdown, resolveNeutralizedManagedAiEnv } from "@paperclipai/shared";
 import { fileURLToPath } from "node:url";
 import type {
   AdapterBillingType,
@@ -703,6 +703,7 @@ export function finalizeLaunchEnvironment(
   options: {
     acpxAgent: string;
     inheritHostEnvironment: boolean;
+    materializesChildEnvironment?: boolean;
     inheritedEnv?: NodeJS.ProcessEnv;
     platform?: typeof process.platform;
   },
@@ -2593,6 +2594,9 @@ async function buildRuntime(input: {
       runtimeEnv = finalizeLaunchEnvironment(env, [], {
         acpxAgent,
         inheritHostEnvironment: !useRemoteProcessSession,
+        // Only a launch on this host spawns the child from this env directly.
+        // An SSH target applies it onto a shell on the far side.
+        materializesChildEnvironment: !executionTargetIsRemote,
       }).env;
     }
   } catch (err) {
@@ -2780,12 +2784,23 @@ async function applySessionConfigOptions(input: {
  * get the closed projection plus a default `PATH` when the host did not provide
  * one. Runner-backed remote sandbox launches get no ambient host state or
  * synthesized host `PATH`; omitting `PATH` preserves the sandbox-native value.
+ *
+ * A launch that materializes the child environment on this host also resolves
+ * the managed-AI neutralization: that env is the child's own, built here from a
+ * closed projection, so a neutralized key belongs absent rather than empty.
+ * Dropping it after the overlay removes the projected host value too, so the
+ * override still holds. Every launch that ships this env somewhere else — a
+ * runner-backed sandbox, an SSH shell — keeps the empty assignment, because it
+ * is merged onto an environment this process does not own and absence there
+ * would re-admit that environment's own value. The caller states which it is;
+ * the default is the conservative one.
  */
 function resolveRuntimeEnv(
   env: Record<string, string>,
   acpxAgent: string,
   options: {
     inheritHostEnvironment: boolean;
+    materializesChildEnvironment?: boolean;
     inheritedEnv?: NodeJS.ProcessEnv;
     platform?: typeof process.platform;
   },
@@ -2804,11 +2819,14 @@ function resolveRuntimeEnv(
     env,
     (options.platform ?? process.platform) === "win32",
   );
-  const finalEnv = Object.fromEntries(
+  const stringEnv = Object.fromEntries(
     Object.entries(mergedEnv).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+  const finalEnv = options.materializesChildEnvironment === true
+    ? resolveNeutralizedManagedAiEnv(stringEnv)
+    : stringEnv;
   // codex-acp supports both key names, but ACP clients must select its
   // api-key authentication method during session creation. Without this
   // request, the server advertises authentication and rejects session/new even
