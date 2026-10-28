@@ -261,6 +261,8 @@ import {
   watchLegacyControllerLease,
 } from "./legacy-controller-lease.js";
 
+import { legacyExecutionSettlementReceipt } from "./legacy-execution-settlement.js";
+
 
 import {
   prepareManagedAiRuntime,
@@ -3878,8 +3880,15 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "failed to release settled native process identity");
           });
         }
+        // Record settlement as its own receipt. Overwriting `execution_stage`
+        // with `settled` here destroyed the dispatch claim, which is committed
+        // before adapter bootstrap and so precedes both the first run event and
+        // the PID write — the only evidence covering that window. It also made
+        // every gate that reads `preparing` unsatisfiable for a run this
+        // executor cancelled, and left `settled` unable to distinguish a run
+        // that reached dispatch from one that never did.
         await db.update(heartbeatRuns).set({
-          executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,
+          resultJson: legacyExecutionSettlementReceipt(new Date(), legacyControllerBootId),
           controllerLeaseExpiresAt: null,
         }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.runtimeMode, "legacy"),
           eq(heartbeatRuns.controllerBootId, legacyControllerBootId),

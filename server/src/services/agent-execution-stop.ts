@@ -6,6 +6,7 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { isCancelledBeforeProviderDispatch } from "./cancelled-pre-dispatch-stop.js";
+import { hasLegacyExecutionSettlement } from "./legacy-execution-settlement.js";
 
 /** Why an agent's executions cannot yet be certified as stopped. One entry per
  * offending row: a short-circuiting answer hides a wedge behind the first
@@ -90,7 +91,7 @@ async function inspect(db: Db, agentIds: string[]) {
         !await isCancelledNativeStartup(db, run, coordinator)) block("native_cancellation_unproven", run.id);
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
-        !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
+        !(hasLegacyExecutionSettlement(run) && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinator) &&
         !await isCancelledBeforeProviderDispatch(db, run, coordinator)) block("legacy_cancellation_unproven", run.id);
   }

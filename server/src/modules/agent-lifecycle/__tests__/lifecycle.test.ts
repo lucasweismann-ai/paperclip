@@ -8,6 +8,7 @@ import { agentLifecycleCompanyDeletion } from "../company-deletion.js";
 import { requireServerAdapter } from "../../../adapters/index.js";
 import { agentExecutionsHaveStopped, describeExecutionStopBlockers, listAgentExecutionStopBlockers } from "../../../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
+import { LEGACY_EXECUTION_SETTLEMENT_KEY, LEGACY_EXECUTION_SETTLEMENT_SCHEMA } from "../../../services/legacy-execution-settlement.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
 import { agentService as agentConfiguration } from "../../../services/agents.js";
@@ -434,18 +435,32 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   // A conversation-adapter run cancelled before its PID was recorded can never
   // earn an acknowledged-cancellation receipt, and both remaining escape
   // hatches are closed to it, so one such row used to block every later pause.
-  const unrecordedCancellation = (agentId: string, executionStage: string) => ({
+  const unrecordedCancellation = (agentId: string, executionStage: string, resultJson?: Record<string, unknown>) => ({
     companyId, agentId, status: "cancelled", invocationSource: "on_demand" as const,
     runtimeMode: "legacy", executionStage, startedAt: new Date(), finishedAt: new Date(),
+    resultJson: (resultJson ?? null) as never,
     runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } } as never,
   });
+  // An executor's own cleanup used to record itself by overwriting the stage
+  // with `settled`; it now leaves the stage alone and writes a receipt. Both
+  // forms must keep admitting the rows they already admitted.
+  const settlementReceipt = {
+    [LEGACY_EXECUTION_SETTLEMENT_KEY]: {
+      schema: LEGACY_EXECUTION_SETTLEMENT_SCHEMA, settledAt: new Date().toISOString(),
+      controllerBootId: null, stage: "dispatching",
+    },
+  };
   async function readyAgent(name = "Ready") {
     return (await db.insert(agents).values({ companyId, name, status: "idle", lifecycleState: "ready" }).returning())[0]!;
   }
 
-  it.each(["preparing", "settled"])("pauses after a conversation-adapter run was cancelled at stage %s before its PID was recorded", async executionStage => {
+  it.each([
+    { executionStage: "preparing", resultJson: undefined },
+    { executionStage: "settled", resultJson: undefined },
+    { executionStage: "dispatching", resultJson: settlementReceipt as Record<string, unknown> },
+  ])("pauses after a conversation-adapter run was cancelled at stage $executionStage before its PID was recorded", async ({ executionStage, resultJson }) => {
     const agent = await readyAgent();
-    const [run] = await db.insert(heartbeatRuns).values(unrecordedCancellation(agent.id, executionStage)).returning();
+    const [run] = await db.insert(heartbeatRuns).values(unrecordedCancellation(agent.id, executionStage, resultJson)).returning();
     const work = worker(createLifecycleDriver(db, {} as never).runHost);
     await createAgentLifecycle(db).pauseAgent(agent.id);
     await work.process(agent.id);

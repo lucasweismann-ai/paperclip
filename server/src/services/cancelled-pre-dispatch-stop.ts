@@ -16,10 +16,12 @@ type Coordinator = typeof nativeRunFinalizations.$inferSelect;
  * proof a single such row blocks every later pause of its agent forever,
  * because the stop scan has no time bound.
  *
- * Execution stage cannot carry the proof: a cancelled legacy run's stage is
- * overwritten with `settled` by its own executor's cleanup, which destroys the
- * `dispatching` marker. Run events are immutable, and every executor commits
- * one before a provider turn, so their absence is the durable evidence. This
+ * Execution stage cannot carry the proof either way. It records the dispatch
+ * claim, which is committed before adapter bootstrap and therefore before the
+ * adapter can emit `adapter.invoke` or spawn anything — so `dispatching` marks
+ * intent, not a started turn, and rows settled by an older build have no stage
+ * left to read at all. Run events are immutable and every adapter commits one
+ * before it launches a child, so their absence is the durable evidence. This
  * admits nothing that reached dispatch: such a run has a PID, a session id, or
  * a dispatch event.
  */
