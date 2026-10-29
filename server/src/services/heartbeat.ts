@@ -261,7 +261,7 @@ import {
 } from "./legacy-controller-lease.js";
 
 import { legacyExecutionSettlementReceipt } from "./legacy-execution-settlement.js";
-import { LEGACY_ADAPTER_ENTERED } from "./run-dispatch-evidence.js";
+import { LEGACY_ADAPTER_ENTERED, LEGACY_ADAPTER_ENTRY_ABANDONED } from "./run-dispatch-evidence.js";
 
 import {
   prepareManagedAiRuntime,
@@ -3448,6 +3448,17 @@ export function heartbeatService(
                 stream: "system",
                 level: "info",
                 message: "legacy adapter entered",
+                payload: { adapterType: adapter.type, executionTargetKind: executionTarget?.kind ?? "local" },
+              });
+            },
+            onLegacyAdapterEntryAbandoned: async () => {
+              legacyAdapterEntered = false;
+              legacyLocalAdapterEntered = false;
+              await appendRunEvent(run, {
+                eventType: LEGACY_ADAPTER_ENTRY_ABANDONED,
+                stream: "system",
+                level: "info",
+                message: "legacy adapter entry abandoned",
                 payload: { adapterType: adapter.type, executionTargetKind: executionTarget?.kind ?? "local" },
               });
             },

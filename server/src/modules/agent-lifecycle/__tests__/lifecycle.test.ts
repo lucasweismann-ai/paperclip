@@ -9,7 +9,7 @@ import { requireServerAdapter } from "../../../adapters/index.js";
 import { agentExecutionsHaveStopped, describeExecutionStopBlockers, listAgentExecutionStopBlockers } from "../../../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
 import { LEGACY_EXECUTION_SETTLEMENT_KEY, LEGACY_EXECUTION_SETTLEMENT_SCHEMA } from "../../../services/legacy-execution-settlement.js";
-import { LEGACY_ADAPTER_ENTERED } from "../../../services/run-dispatch-evidence.js";
+import { LEGACY_ADAPTER_ENTERED, LEGACY_ADAPTER_ENTRY_ABANDONED } from "../../../services/run-dispatch-evidence.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
 import { agentService as agentConfiguration } from "../../../services/agents.js";
@@ -478,6 +478,26 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       await createAgentLifecycle(db).pauseAgent(agent.id);
       await work.process(agent.id);
       expect((await current(agent.id)).lifecycleState).toBe("pausing");
+    });
+
+  it.each(["http", "hermes_local", "claude_local"])(
+    "pauses a cancelled %s run whose adapter entry was abandoned before the adapter ran", async (adapterType) => {
+      const agent = await readyAgent();
+      const [run] = await db.insert(heartbeatRuns).values({
+        ...unrecordedCancellation(agent.id, "preparing"),
+        runnerProfileJson: { adapterDispatch: { adapterType } } as never,
+      }).returning();
+      await db.insert(heartbeatRunEvents).values([
+        { companyId, runId: run.id, agentId: agent.id, seq: 1, eventType: LEGACY_ADAPTER_ENTERED },
+        { companyId, runId: run.id, agentId: agent.id, seq: 2, eventType: LEGACY_ADAPTER_ENTRY_ABANDONED },
+      ]);
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+      const work = worker(createLifecycleDriver(db, {} as never).runHost);
+      await createAgentLifecycle(db).pauseAgent(agent.id);
+      await work.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("paused");
+      await db.insert(heartbeatRunEvents).values({ companyId, runId: run.id, agentId: agent.id, seq: 3, eventType: LEGACY_ADAPTER_ENTERED });
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
     });
 
   it("reports every execution that blocks a stop, not only the first", async () => {

@@ -190,6 +190,7 @@ export interface HeartbeatRuntimeExecutionInput {
     onUsageCaptureReady: (persistFailure: () => Promise<void>) => void;
     onNativeDispatchStarted: () => void;
     onLegacyAdapterEntered: () => Promise<void>;
+    onLegacyAdapterEntryAbandoned: () => Promise<void>;
     onWorkspaceRestoreFailure: (evidence: Record<string, unknown>) => void;
     onProviderResourceDisposition: (disposition: ProviderResourceDisposition) => void;
     onNativeWorkspaceFinalizeScheduled: () => void;
@@ -810,6 +811,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             const admitted = await getRun(run.id, { includeExecutionEvidence: true });
             if (!admitted || isHeartbeatRunTerminalStatus(admitted.status)
               || admitted.resultJson?.cancellation || admitted.resultJson?.startupCancellation) {
+              await input.effects.onLegacyAdapterEntryAbandoned();
               return { exitCode: null, signal: null, timedOut: false,
                 executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } };
             }
