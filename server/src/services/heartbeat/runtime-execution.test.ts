@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { trace } from "@opentelemetry/api";
@@ -22,6 +22,8 @@ import { NativeWorkspaceFinalizationBusyError, NativeWorkspaceFinalizationOwners
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
+import { agentExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { LEGACY_ADAPTER_ENTERED } from "../run-dispatch-evidence.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
@@ -181,6 +183,22 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await read(run.id)).toMatchObject({ usageJson: { accountingProviderWorkStarted: false } });
     expect(await db.select().from(runUsageReceipts)).toHaveLength(0);
     expectCleanup(input);
+  });
+
+  it("blocks a stop that lands after the handoff recheck, before the adapter can report anything", async () => {
+    const { input, adapter, run } = await fixture();
+    input.effects.onLegacyAdapterEntered = vi.fn(async () => {
+      await db.insert(heartbeatRunEvents).values({
+        companyId: input.agent.companyId, runId: run.id, agentId: input.agent.id, seq: 1, eventType: LEGACY_ADAPTER_ENTERED,
+      });
+    });
+    adapter.execute.mockImplementationOnce(async () => {
+      await db.update(heartbeatRuns).set({ status: "cancelled", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      expect(await agentExecutionsHaveStopped(db, [input.agent.id])).toBe(false);
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+    await executeHeartbeatRuntime(db, input);
+    expect(adapter.execute).toHaveBeenCalledOnce();
   });
 
   it.each([
